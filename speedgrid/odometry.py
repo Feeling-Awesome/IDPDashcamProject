@@ -28,7 +28,7 @@ from .camera import CameraModel
 
 class SurfaceOdometry:
     def __init__(self, cam: CameraModel, fps: float, ppm: float = 16.0, half_width_m: float = 6.0,
-                 max_speed_mps: float = 55.0, src_scale: float = 1.0):
+                 max_speed_mps: float = 160.0, src_scale: float = 1.0):
         self.cam = cam
         self.fps = fps
         self.ppm = ppm
@@ -168,12 +168,17 @@ class SurfaceOdometry:
         # also try 4 and 8 frames back (keeps slow driving measurable).
         recent = [v for v in self.recent[-15:] if np.isfinite(v)]
         fast = len(recent) >= 3 and np.median(recent) > 0.15     # > ~0.15 m/frame
+        # once the speed is roughly known, search only up to ~1.7x it: that leaves a much
+        # longer piece of road to compare (more reliable), and still follows acceleration
+        max_shift = self.max_shift
+        if len(recent) >= 3:
+            max_shift = min(self.max_shift, int(np.ceil(1.7 * np.median(recent) * self.ppm)) + 8)
         for stride in ((1,) if fast else (1, 4, 8)):
             if len(hist) <= stride:
                 break
             prev = hist[-1 - stride]
             p = prev - self.bg if self.n > 30 else prev
-            r = self._measure(p, c, min(self.max_shift * stride, int(self.size[1] * 0.6)))
+            r = self._measure(p, c, min(max_shift * stride, int(self.size[1] * 0.6)))
             if r is not None:
                 self.quality.append(r[1])
                 d = r[0] / self.ppm / stride
@@ -181,6 +186,8 @@ class SurfaceOdometry:
                 return d
         self.quality.append(0.0)
         self.recent.append(np.nan)
+        if len(self.recent) > 40 and not any(np.isfinite(self.recent[-40:])):
+            self.recent.clear()          # lost for a while: go back to searching all speeds
         return np.nan
 
 

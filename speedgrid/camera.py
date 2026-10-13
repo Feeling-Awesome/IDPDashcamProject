@@ -83,6 +83,8 @@ class CameraModel:
                 int(round(self.bev_length_m * self.ppm)))
 
     def image_to_ground(self, pts: np.ndarray) -> np.ndarray:
+        if len(pts) == 0:
+            return np.zeros((0, 2))
         p = cv2.perspectiveTransform(pts.reshape(-1, 1, 2).astype(np.float64),
                                      np.linalg.inv(self.G2I))
         return p.reshape(-1, 2)
@@ -149,34 +151,54 @@ def _line_segments(img: np.ndarray, roi_top: int):
                            minLineLength=img.shape[1] // 30, maxLineGap=20)
 
 
-def estimate_vanishing_point(frames: list[np.ndarray]) -> tuple[float, float] | None:
-    """Robust VP from the converging road/lane edges across sampled frames.
+def _paint_segments(img: np.ndarray, roi_top: int):
+    """Line segments of painted lane lines (thin bright stripes): a white top-hat keeps
+    paint and drops trees, verges, clouds and text, which only distract the estimate."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    H, W = gray.shape
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (max(W // 60, 5) | 1, 1))
+    th = cv2.morphologyEx(cv2.GaussianBlur(gray, (3, 3), 0), cv2.MORPH_TOPHAT, k)
+    sub = th[roi_top:]
+    thr = max(25.0, float(np.percentile(sub, 98.5)))
+    bw = (th > thr).astype(np.uint8) * 255
+    bw[:roi_top] = 0
+    return cv2.HoughLinesP(bw, 1, np.pi / 180, threshold=20, minLineLength=W // 25, maxLineGap=25)
 
-    Hough line segments on the lower part of the frame are split into
-    left-leaning and right-leaning sets; the intersections of left/right pairs
-    vote, and the densest cluster (via a median after outlier trimming) wins.
+
+def estimate_vanishing_point(frames: list[np.ndarray]) -> tuple[float, float] | None:
+    """Robust VP from the converging road/lane lines across sampled frames.
+
+    Hough line segments (painted lines weighted x3, plus general edges) on the
+    lower part of the frame are split into left- and right-leaning sets; the
+    intersections of left/right pairs vote in a 2-D histogram and the peak wins.
     """
     if not frames:
         return None
     H, W = frames[0].shape[:2]
     pts = []
     for fr in frames:
-        segs = _line_segments(fr, int(H * 0.45))
-        if segs is None:
+        sources = []
+        ps = _paint_segments(fr, int(H * 0.45))
+        if ps is not None:
+            sources.append((ps, 3.0))          # painted lines count three times as much
+        es = _line_segments(fr, int(H * 0.45))
+        if es is not None:
+            sources.append((es, 1.0))
+        if not sources:
             continue
         left, right = [], []
-        for x1, y1, x2, y2 in segs.reshape(-1, 4).astype(float):
-            if x2 == x1:
-                continue
-            ang = np.degrees(np.arctan2(y2 - y1, x2 - x1))
-            ang = (ang + 180) % 180
-            length = np.hypot(x2 - x1, y2 - y1)
-            line = np.array([y1 - y2, x2 - x1, x1 * y2 - x2 * y1])  # homogeneous line
-            mx = (x1 + x2) / 2
-            if 10 < ang < 80 and mx > W * 0.35:        # "\" on the right side
-                right.append((line, length))
-            elif 100 < ang < 170 and mx < W * 0.65:    # "/" on the left side
-                left.append((line, length))
+        for segs, wgt in sources:
+            for x1, y1, x2, y2 in segs.reshape(-1, 4).astype(float):
+                if x2 == x1:
+                    continue
+                ang = (np.degrees(np.arctan2(y2 - y1, x2 - x1)) + 180) % 180
+                length = np.hypot(x2 - x1, y2 - y1) * wgt
+                line = np.array([y1 - y2, x2 - x1, x1 * y2 - x2 * y1])  # homogeneous line
+                mx = (x1 + x2) / 2
+                if 10 < ang < 80 and mx > W * 0.35:        # "\" on the right side
+                    right.append((line, length))
+                elif 100 < ang < 170 and mx < W * 0.65:    # "/" on the left side
+                    left.append((line, length))
         left = sorted(left, key=lambda t: -t[1])[:20]
         right = sorted(right, key=lambda t: -t[1])[:20]
         for la, wa in left:
@@ -186,7 +208,7 @@ def estimate_vanishing_point(frames: list[np.ndarray]) -> tuple[float, float] | 
                 if abs(p[2]) < 1e-9:
                     continue
                 x, y = p[0] / p[2], p[1] / p[2]
-                if 0.1 * W < x < 0.9 * W and 0.15 * H < y < 0.75 * H:
+                if 0.1 * W < x < 0.9 * W and 0.1 * H < y < 0.92 * H:
                     pts.append((x, y, np.sqrt(wa * wb)))
     if len(pts) < 8:
         return None

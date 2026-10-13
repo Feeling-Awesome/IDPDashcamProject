@@ -29,7 +29,7 @@ class MarkingEnd:
 
 
 def detect_markings(bev_bgr: np.ndarray, cam: CameraModel, road_mask: np.ndarray | None,
-                    stats_mask: np.ndarray | None = None):
+                    stats_mask: np.ndarray | None = None, return_tophat: bool = False):
     ppm = cam.ppm
     Hb, Wb = bev_bgr.shape[:2]
     valid = cam.valid_bev_mask()
@@ -47,7 +47,8 @@ def detect_markings(bev_bgr: np.ndarray, cam: CameraModel, road_mask: np.ndarray
     stat_region = region if stats_mask is None else cv2.bitwise_and(valid, stats_mask)
     hist = cv2.calcHist([tophat], [0], stat_region, [256], [0, 256]).ravel()
     if hist.sum() < 100:
-        return np.zeros((Hb, Wb), np.uint8), []
+        empty = np.zeros((Hb, Wb), np.uint8)
+        return (empty, [], None) if return_tophat else (empty, [])
     # median / MAD from the histogram (tophat is uint8): no sorting needed
     med = _hist_median(hist)
     dev = np.abs(np.arange(256) - med).astype(np.int64)
@@ -102,6 +103,8 @@ def detect_markings(bev_bgr: np.ndarray, cam: CameraModel, road_mask: np.ndarray
             if yi <= 3 or yi >= Hb - 4:
                 continue
             ends.append(MarkingEnd(ex, ey, kind, i))
+    if return_tophat:
+        return accept[lbl], ends, tophat
     return accept[lbl], ends
 
 

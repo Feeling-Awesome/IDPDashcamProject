@@ -43,7 +43,7 @@ class SpeedSample:
 
 
 class MarkingTracker:
-    def __init__(self, line_s: np.ndarray, max_speed_mps: float = 70.0):
+    def __init__(self, line_s: np.ndarray, max_speed_mps: float = 160.0):
         self.line_s = np.asarray(line_s, float)
         self.tracks: list[Track] = []
         self.next_id = 1
@@ -196,7 +196,7 @@ def _assign(C: np.ndarray):
     return pairs
 
 
-METHOD_NAMES = {"M": "lane markings", "S": "road surface"}
+METHOD_NAMES = {"M": "lane markings", "L": "lane markings", "S": "road surface"}
 
 
 def window_row(w: int, a: float, b: float, seg: np.ndarray, st: np.ndarray, n_samp: int,
@@ -207,7 +207,7 @@ def window_row(w: int, a: float, b: float, seg: np.ndarray, st: np.ndarray, n_sa
     if methods is not None:
         ms = [m for m in methods if m in METHOD_NAMES]
         if ms:
-            nm, ns = ms.count("M"), ms.count("S")
+            nm, ns = ms.count("M") + ms.count("L"), ms.count("S")
             row["method"] = (METHOD_NAMES["M"] if ns == 0 else METHOD_NAMES["S"] if nm == 0
                              else "markings + surface")
     if len(seg) and st.mean() >= 0.9:
@@ -215,7 +215,8 @@ def window_row(w: int, a: float, b: float, seg: np.ndarray, st: np.ndarray, n_sa
     elif len(known) >= 0.5 * len(seg) and len(known):
         v = float(np.mean(known))          # time-average over the window
         status = "moving" if st.mean() < 0.1 else "stopping/starting"
-        if status == "moving" and n_samp < 4 and row["method"] == METHOD_NAMES["M"]:
+        if (status == "moving" and n_samp < 4 and methods is not None
+                and sum(m == "M" for m in methods) > 0.5 * len(methods)):
             status = "low data"
         row.update(speed_mps=round(v, 2), speed_kmh=round(v * 3.6, 1), status=status)
     return row
@@ -262,6 +263,7 @@ class LiveTimeline:
         self.raw: list[float] = []
         self.final: list[float] = []
         self.surface: list[float] = []      # per-frame road-surface speed (m/s) or NaN
+        self.lines: list[float] = []        # per-frame dashed-line pattern speed (m/s) or NaN
         self.method: list[str] = []         # per-frame source: Z(stopped) M S I(bridged) 
         self.last_known: int | None = None
         self.bridge_frames = bridge * fps
@@ -280,18 +282,31 @@ class LiveTimeline:
 
     def _raw_value(self, k: int):
         t = k / self.fps
-        a = bisect.bisect_left(self.ts, t - self.half)
-        b = bisect.bisect_left(self.ts, t + self.half)
-        n_mark = b - a
-        if n_mark >= 4:                     # real dashed markings: the primary method
-            return self._robust(np.array(self.vs[a:b])), "M"
         h = int(round(self.half * self.fps))
-        seg = np.array(self.surface[max(k - h, 0):k + h + 1], float)
-        ok = seg[np.isfinite(seg)]
-        if len(ok) >= max(3, 0.35 * len(seg)):
-            return self._robust(ok), "S"
-        if n_mark >= 2:                     # a few marking crossings, no surface reading
-            return self._robust(np.array(self.vs[a:b])), "M"
+        # normal window first; if the evidence is sparse (fast or sparse markings, little
+        # texture) look twice as far either side before giving up
+        for scale in (1, 2):
+            a = bisect.bisect_left(self.ts, t - self.half * scale)
+            b = bisect.bisect_left(self.ts, t + self.half * scale)
+            n_mark = b - a
+            lseg = np.array(self.lines[max(k - h * scale, 0):k + h * scale + 1], float)
+            lok = lseg[np.isfinite(lseg)]
+            v_line = self._robust(lok) if len(lok) >= max(3, 0.35 * len(lseg) / scale) else None
+            if n_mark >= 4:                     # dash ends crossing the grid lines
+                v_cross = self._robust(np.array(self.vs[a:b]))
+                # when dashes jump far between frames, single-dash tracking can mix dashes
+                # up; the whole-pattern match is then the more reliable of the two
+                if v_line is not None and abs(v_cross - v_line) > 0.2 * v_line:
+                    return v_line, "L"
+                return v_cross, "M"
+            if v_line is not None:              # dashed-line pattern motion
+                return v_line, "L"
+            seg = np.array(self.surface[max(k - h * scale, 0):k + h * scale + 1], float)
+            ok = seg[np.isfinite(seg)]
+            if len(ok) >= max(3, 0.35 * len(seg) / scale):
+                return self._robust(ok), "S"
+            if n_mark >= 2 and scale == 2:      # a few marking crossings, no other reading
+                return self._robust(np.array(self.vs[a:b])), "M"
         return np.nan, ""
 
     def compute_raw(self, upto: int, stationary: list[bool]):

@@ -26,7 +26,8 @@ from .markings import detect_markings, measure_lane_spacing
 from .road import RoadGrid, RoadModel
 from .egomotion import EgoMotion
 from .odometry import GroundFlow, SurfaceOdometry
-from .tracker import (LiveTimeline, MarkingTracker, aggregate_windows, window_bounds,
+from .lineflow import LinePatternFlow
+from .tracker import (LiveTimeline, MarkingTracker, SpeedSample, aggregate_windows, window_bounds,
                       window_row)
 
 GRID_COLOUR = (0, 230, 255)      # yellow (BGR)
@@ -46,6 +47,7 @@ class Settings:
     grid_start_m: float = 1.0
     window_s: float = 3.0
     proc_width: int = 960
+    speedup: float = 1.0                  # video is fast-forwarded by this factor (1 = real time)
 
 
 def _ffmpeg_exe():
@@ -251,6 +253,14 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
         fps = 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
     cap.release()
+    # Re-uploaded / converted videos often repeat frames (e.g. 25 fps shown as 30 fps by
+    # repeating every 6th frame).  Repeated frames are skipped and real frames are timed
+    # at the true rate, otherwise motion looks like jump-freeze-jump and timing fails.
+    dup_rate = _duplicate_rate(path)
+    fps_eff = _true_rate(fps, dup_rate) if dup_rate >= 0.04 else fps
+    calib["repeated_frames"] = round(dup_rate, 3)
+    if fps_eff != fps:
+        calib["true_fps"] = round(fps_eff, 3)
     bev_size = cam.bev_size
     I2BEV = cam.I2BEV
     width = s.proc_width
@@ -264,14 +274,15 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
     tracker = MarkingTracker(grid_s)
     ego = EgoMotion(cam, fps)
     live = LiveTimeline(fps)
-    odo = SurfaceOdometry(cam, fps)
-    gflow = GroundFlow(cam, fps)
+    odo = SurfaceOdometry(cam, fps_eff)
+    gflow = GroundFlow(cam, fps_eff)
+    lflow = LinePatternFlow(cam, fps_eff)
     recent_surf: deque = deque(maxlen=int(fps))
     writer = VideoWriter(out / "annotated.mp4", cam.width, cam.height, fps)
 
     # Frames are drawn a few seconds after they are analysed, once their speed
     # values are final, so the video, the HUD and the table always agree.
-    lag_raw = int(np.ceil(live.half * fps)) + ego.enter + 6
+    lag_raw = int(np.ceil(2 * live.half * fps)) + ego.enter + 6
     pending: deque = deque()              # (frame index, small frame, overlay)
     rows_done: dict[int, dict] = {}
     st_hist = ego.history                 # per-frame 'stopped' flags (shared list)
@@ -297,7 +308,7 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
             if st_hist[j]:
                 speed_txt = "speed    0.0 km/h (stopped)"
             else:
-                src = {"M": " (markings)", "S": " (surface)"}.get(live.method[j], "")
+                src = {"M": " (markings)", "L": " (markings)", "S": " (surface)"}.get(live.method[j], "")
                 speed_txt = "speed  " + (f"{v * 3.6:5.1f} km/h{src}" if np.isfinite(v) else "  --")
             w = int(t // s.window_s)
             row = hud_window_row(w - 1) if w >= 1 else None
@@ -319,19 +330,50 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
     fi = 0
     flash: dict[int, float] = {}
     free_s = None                     # unobstructed road length ahead (m)
+    dedup = fps_eff != fps
+    sp = max(float(s.speedup or 1.0), 0.01)
+    sig_prev = None
+    diffs: deque = deque(maxlen=30)
+    n_unique = 0
+    last_ov = None
     try:
         for small, bev in FrameSource(path, prepare):
             if cancel is not None and cancel.is_set():
                 raise RuntimeError("Cancelled")
-            t = fi / fps
+
+            # repeated frame?  (only meaningful while the picture is actually changing)
+            sig = cv2.resize(cv2.cvtColor(small[small.shape[0] // 2:], cv2.COLOR_BGR2GRAY), (160, 45),
+                             interpolation=cv2.INTER_AREA).astype(np.float32)
+            repeat = False
+            if sig_prev is not None:
+                dif = float(np.mean(np.abs(sig - sig_prev)))
+                med = float(np.median(diffs)) if len(diffs) >= 5 else dif
+                repeat = dedup and med > 1.5 and dif < 0.15 * med
+                if not repeat:
+                    diffs.append(dif)
+            sig_prev = sig
+            if repeat and last_ov is not None:
+                # nothing new in this frame: keep the per-frame records aligned, skip analysis
+                live.surface.append(np.nan)
+                live.lines.append(np.nan)
+                ego.history.append(ego.stationary)
+                pending.append((fi, small, last_ov))
+                fi += 1
+                ready = fi - 1 - lag_raw
+                if ready >= 0:
+                    live.compute_raw(ready, st_hist)
+                    flush(live.finalize(ready))
+                continue
+            t = n_unique / fps_eff            # true time of this real frame
+            n_unique += 1
 
             road.update(bev, marking_mask, line_mask=marking_wide)
             # look for paint well beyond the current road edges too, so solid edge lines
             # outside a too-narrow colour estimate can still be found (and snapped to)
             wide = road.band_mask(margin_m=5.0)
             band = road.band_mask()
-            marking_wide, ends = detect_markings(bev, cam, wide if wide is not None else road.mask,
-                                                 stats_mask=band)
+            marking_wide, ends, tophat = detect_markings(bev, cam, wide if wide is not None else road.mask,
+                                                         stats_mask=band, return_tophat=True)
             marking_mask = cv2.bitwise_and(marking_wide, band) if band is not None else marking_wide
             grid = RoadGrid(cam, road, s.grid_start_m, s.grid_lines)
             f = grid.free_distance(road.mask)
@@ -347,25 +389,33 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
                     # on the road, and not on a vehicle ahead (white bodywork looks like paint)
                     if abs(dd) <= hw + 0.6 and (free_s is None or ss < free_s - 0.5):
                         dets.append((float(ss), float(dd), e.kind, e.x, e.y))
+            # dashed-line pattern motion (robust when dashes move far between frames)
+            lflow.observe_dashes([d[1] for d in dets])
+            d_line = lflow.update(tophat, grid, free_s)
+            v_line = d_line * fps_eff if np.isfinite(d_line) else np.nan
+            live.lines.append(v_line / sp if np.isfinite(v_line) else np.nan)
             # road-surface speed (works with or without markings)
             d_strip = odo.update(small, free_s)          # dense: road texture just ahead
             d_feat = gflow.update(small)                 # sparse: features over all ground
-            v_surf = _combine(d_strip * fps, d_feat * fps, recent_surf)
+            v_surf = _combine(d_strip * fps_eff, d_feat * fps_eff, recent_surf)
             if np.isfinite(v_surf):
                 recent_surf.append(v_surf)
-            live.surface.append(v_surf)
+            live.surface.append(v_surf / sp)          # on-screen -> real speed
             marking_moving = any(tr.hits >= 5 and tr.misses == 0 and -tr.x[1] > 2.0
                                  for tr in tracker.tracks)
-            marking_moving = marking_moving or (np.isfinite(v_surf) and v_surf > 2.0)
+            marking_moving = (marking_moving or (np.isfinite(v_surf) and v_surf > 2.0)
+                              or lflow.moving)
             mature = [tr for tr in tracker.tracks if tr.hits >= 10 and tr.misses == 0]
             markings_still = bool(mature) and all(abs(tr.x[1]) < 0.4 for tr in mature)
             tracker.stationary = ego.update(bev, marking_moving, markings_still, gflow.image_motion)
-            live.add(tracker.step(t, dets))
+            live.add([SpeedSample(x.t, x.speed_mps / sp, x.track, x.line_pair, x.dt)
+                      for x in tracker.step(t, dets)])
             for tc, k in tracker.recent_crossings:
                 flash[k] = tc
             tracker.recent_crossings.clear()
 
-            pending.append((fi, small, _overlay(cam, grid, marking_mask, tracker, t, flash, free_s)))
+            last_ov = _overlay(cam, grid, marking_mask, tracker, t, flash, free_s)
+            pending.append((fi, small, last_ov))
             fi += 1
             ready = fi - 1 - lag_raw
             if ready >= 0:
@@ -385,6 +435,11 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
     stationary = np.array(st_hist[:fi], bool)
     timeline = np.array(live.final[:fi], float)
     rows = aggregate_windows(tracker.samples, timeline, stationary, fps, s.window_s, live.method[:fi])
+    moving = [r["speed_kmh"] for r in rows if r["speed_kmh"]]
+    if moving and np.median(moving) > 200 and sp == 1.0:
+        calib["warning"] = (f"On-screen speed is about {np.median(moving):.0f} km/h - this video looks "
+                            "fast-forwarded. If you know by how much (e.g. 3x), set 'Video sped up' "
+                            "in Settings and analyse again.")
 
     result = {
         "fps": round(fps, 3), "frames": fi, "duration_s": round(duration, 2),
@@ -392,7 +447,7 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
         "stationary_s": round(float(stationary.sum()) / fps, 2),
         "surface_kmh": [None if not np.isfinite(v) else round(float(v) * 3.6, 1) for v in live.surface[:fi]],
         "timeline_kmh": [None if np.isnan(v) else round(float(v) * 3.6, 1) for v in timeline],
-        "samples": [{"t": round(x.t, 3), "speed_kmh": round(x.speed_mps * 3.6, 2),
+        "samples": [{"t": round(x.t, 3), "speed_kmh": round(x.speed_mps / sp * 3.6, 2),
                      "track": x.track, "lines": list(x.line_pair), "dt_s": round(x.dt, 4)}
                     for x in tracker.samples],
     }
@@ -406,6 +461,37 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
                         r["status"], r["method"], r["samples"]])
     progress(1.0, "Done")
     return result
+
+
+def _duplicate_rate(path: str, n: int = 300) -> float:
+    """Fraction of frames that exactly repeat the previous one (frame-rate conversion)."""
+    cap = cv2.VideoCapture(path)
+    prev, diffs = None, []
+    for _ in range(n):
+        ok, fr = cap.read()
+        if not ok:
+            break
+        g = cv2.resize(cv2.cvtColor(fr[fr.shape[0] // 2:], cv2.COLOR_BGR2GRAY), (160, 45),
+                       interpolation=cv2.INTER_AREA).astype(np.float32)
+        if prev is not None:
+            diffs.append(float(np.mean(np.abs(g - prev))))
+        prev = g
+    cap.release()
+    d = np.array(diffs)
+    if len(d) < 20:
+        return 0.0
+    med = float(np.median(d))
+    if med < 1.5:                 # mostly standing still: can't tell repeats from stillness
+        return 0.0
+    return float((d < 0.15 * med).mean())
+
+
+def _true_rate(fps: float, dup_rate: float) -> float:
+    eff = fps * (1.0 - dup_rate)
+    for std in (23.976, 24.0, 25.0, 29.97, 30.0, 50.0, 59.94, 60.0):
+        if abs(eff - std) / std < 0.03:
+            return std
+    return eff
 
 
 def _combine(v_strip: float, v_feat: float, recent) -> float:

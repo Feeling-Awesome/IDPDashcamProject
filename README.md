@@ -26,7 +26,10 @@ grain, the verge) moves across the grid between frames. The table says which was
    surface). Click a row to jump the video there. Space = play/pause.
 3. **Save video…** / **Save table (CSV)…**, or **Open folder** (results are also kept in
    `Documents\RoadSpeed`).
-4. **Calibrate… (do this once per dashcam).** Every speed scales with the camera's
+4. **Fast-forwarded video?** If a clip was sped up (common for road-trip videos online),
+   the app warns you (on-screen speeds of 200+ km/h). Set *Settings → Video sped up ×*
+   (e.g. 3) and analyse again to get the real speed.
+5. **Calibrate… (do this once per dashcam).** Every speed scales with the camera's
    field of view. Pick a stretch where you know the real speed (speedometer, GPS,
    cruise control), enter it, and the app corrects the field of view, remembers it,
    and can re-analyse. Lane-width auto-scaling handles the camera height for you.
@@ -50,7 +53,9 @@ Command line (no window): `python cli.py video.mp4 --hfov 110`
 | Free space | Grid is drawn only up to the first vehicle blocking the lane ahead (a vehicle smears far away from the camera in the top-down view, so only long blocked stretches count; small gaps at the frame edge, shadows or cracks are ignored) |
 | Stop detection | Near-field road patch registered frame-to-frame with **FFT phase correlation** + frame-difference test, plus "markings tracked but not moving"; overall feature motion across the picture must also be ~0 (stops blurry/compressed video being mistaken for standing still); hysteresis; moving markings or surface veto |
 | Road-surface speed (any road) | **Dense:** a strip of road just ahead is re-projected to a fine top-down view every frame; along-road structure (solid lines, worn wheel tracks) is removed and a slowly-updated background takes out anything fixed in the picture (reflections, bonnet, text); the shift between frames is found by **normalised cross-correlation** (coarse-to-fine, sub-pixel), taking the strongest *distinct* peak away from zero so static compression noise can't pull it to 0; slow driving is compared over 4-8 frames. **Sparse:** corner features over the whole ground area tracked with **pyramidal Lucas-Kanade** (forward-backward checked), mapped to the ground plane, robust mode of their travel. The dense estimate is preferred, the sparse one fills gaps |
-| Fusion | Per moment: lane-marking crossings when there are enough of them (≥ 4 within ±0.75 s), else road surface, else a few marking crossings; stopped = 0 |
+| Dashed-line pattern | The brightness profile along each dashed lane line (dash, gap, dash … over ~25 m) is matched between frames (NCC, sub-pixel); robust when dashes move a large part of their spacing per frame (fast driving, low frame rate, fast-forwarded video) where following single dashes mixes them up. A line is only used if its profile really looks like dashes, and never beyond a vehicle ahead |
+| Repeated frames | Videos converted between frame rates (e.g. 25 → 30 fps) repeat frames; these are detected, skipped, and real frames are timed at the true rate |
+| Fusion | Per moment: dash crossings of the grid lines (≥ 4 within ±0.75 s; the pattern match wins if they disagree by > 20 %), else dashed-line pattern motion, else road surface, else a few crossings; the window widens to ±1.5 s when evidence is sparse; stopped = 0 |
 | Edge lines | Paint is searched up to 5 m beyond the colour-based road edge; a long solid line there becomes the grid edge (fixes two-tone / worn roads), and the edge stays locked to it through frames where the line isn't seen |
 | Crossing validation | A pair of crossings only counts if both happen within 0.6 s, the marking is moving, and the result agrees with its Kalman velocity (±35 %); nothing is counted while stopped |
 | Reporting | Per-frame speed timeline (0 when stopped, robust median of nearby samples otherwise, short gaps bridged) → time-averaged per 3 s window with a status: moving / stopped / stopping-starting / low data / no data. The video is drawn in the same pass, a few seconds behind the analysis, so its overlay shows the final numbers (same as the table) |
@@ -63,6 +68,7 @@ Command line (no window): `python cli.py video.mp4 --hfov 110`
 * **Horizon** - auto. Set a % only if the grid looks tilted on a very hilly road.
 * **Bonnet** - auto (static rows at the bottom are ignored); set a % to override.
 * **Grid lines / Report every** - number of 1 m grid lines, and the table interval.
+* **Video sped up ×** - 1 for normal video; e.g. 3 for a 3x fast-forwarded clip.
 
 ## Limits
 

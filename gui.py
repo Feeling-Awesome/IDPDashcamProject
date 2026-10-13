@@ -72,6 +72,7 @@ class SettingsPanel(ttk.Frame):
         ("bonnet_frac", "Bonnet at bottom (%, 0 = auto)", 0.0),
         ("grid_lines", "Grid lines (1 m apart)", 12),
         ("window_s", "Report every (seconds)", 3.0),
+        ("speedup", "Video sped up × (1 = real time)", 1.0),
     ]
 
     def __init__(self, master):
@@ -128,6 +129,7 @@ class SettingsPanel(ttk.Frame):
             bonnet_frac=num("bonnet_frac", 0.0, 0, 50) / 100.0,
             grid_lines=int(num("grid_lines", 12, 3, 40)),
             window_s=num("window_s", 3.0, 0.5, 60),
+            speedup=num("speedup", 1.0, 0.1, 100),
         )
 
 
@@ -370,6 +372,10 @@ class App:
         hint = ("" if c.get("scale_factor") else
                 " No lane pair to auto-scale from on this road: use Calibrate… once with a known "
                 "speed for exact values.")
+        if c.get("warning"):
+            hint = " ⚠ " + c["warning"]
+        if c.get("true_fps"):
+            hint += f" (Repeated frames removed: real frame rate {c['true_fps']:g} fps.)"
         self.summary.configure(
             text=f"{avg}Stopped for {res['stationary_s']:.0f} s of {res['duration_s']:.0f} s. "
                  f"Camera height {c['camera_height_m']} m"
@@ -378,6 +384,8 @@ class App:
         for b in (self.save_vid_btn, self.save_csv_btn, self.folder_btn, self.calib_btn):
             b.configure(state="normal")
         self._open_player(self.out_dir / "annotated.mp4")
+        if c.get("warning"):
+            messagebox.showwarning(APP_NAME, c["warning"])
 
     # ---------------------------------------------------------------- player
     def _open_player(self, path: Path):
