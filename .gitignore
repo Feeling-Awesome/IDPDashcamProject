@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# local setup / builds (made by the .bat scripts)
+.venv/
+.build-venv/
+build/
+dist/
+*.spec
+
+# analysis output
+output/
