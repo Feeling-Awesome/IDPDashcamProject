@@ -25,6 +25,7 @@ from .camera import CameraModel, estimate_vanishing_point
 from .markings import detect_markings, measure_lane_spacing
 from .road import RoadGrid, RoadModel
 from .egomotion import EgoMotion
+from .odometry import GroundFlow, SurfaceOdometry
 from .tracker import (LiveTimeline, MarkingTracker, aggregate_windows, window_bounds,
                       window_row)
 
@@ -263,6 +264,9 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
     tracker = MarkingTracker(grid_s)
     ego = EgoMotion(cam, fps)
     live = LiveTimeline(fps)
+    odo = SurfaceOdometry(cam, fps)
+    gflow = GroundFlow(cam, fps)
+    recent_surf: deque = deque(maxlen=int(fps))
     writer = VideoWriter(out / "annotated.mp4", cam.width, cam.height, fps)
 
     # Frames are drawn a few seconds after they are analysed, once their speed
@@ -281,7 +285,8 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
         if len(live.final) < fb:
             return None
         n_samp = bisect.bisect_left(live.ts, b) - bisect.bisect_left(live.ts, a)
-        rows_done[w] = window_row(w, a, b, np.array(live.final[fa:fb]), np.array(st_hist[fa:fb]), n_samp)
+        rows_done[w] = window_row(w, a, b, np.array(live.final[fa:fb]), np.array(st_hist[fa:fb]), n_samp,
+                                  live.method[fa:fb])
         return rows_done[w]
 
     def flush(upto_final):
@@ -292,7 +297,8 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
             if st_hist[j]:
                 speed_txt = "speed    0.0 km/h (stopped)"
             else:
-                speed_txt = "speed  " + (f"{v * 3.6:5.1f} km/h" if np.isfinite(v) else "  --")
+                src = {"M": " (markings)", "S": " (surface)"}.get(live.method[j], "")
+                speed_txt = "speed  " + (f"{v * 3.6:5.1f} km/h{src}" if np.isfinite(v) else "  --")
             w = int(t // s.window_s)
             row = hud_window_row(w - 1) if w >= 1 else None
             if row is None:
@@ -309,6 +315,7 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
                 preview(vis)
 
     marking_mask = None
+    marking_wide = None
     fi = 0
     flash: dict[int, float] = {}
     free_s = None                     # unobstructed road length ahead (m)
@@ -318,9 +325,14 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
                 raise RuntimeError("Cancelled")
             t = fi / fps
 
-            road.update(bev, marking_mask)
+            road.update(bev, marking_mask, line_mask=marking_wide)
+            # look for paint well beyond the current road edges too, so solid edge lines
+            # outside a too-narrow colour estimate can still be found (and snapped to)
+            wide = road.band_mask(margin_m=5.0)
             band = road.band_mask()
-            marking_mask, ends = detect_markings(bev, cam, band if band is not None else road.mask)
+            marking_wide, ends = detect_markings(bev, cam, wide if wide is not None else road.mask,
+                                                 stats_mask=band)
+            marking_mask = cv2.bitwise_and(marking_wide, band) if band is not None else marking_wide
             grid = RoadGrid(cam, road, s.grid_start_m, s.grid_lines)
             f = grid.free_distance(road.mask)
             # drop instantly when something pulls in front, recover gently
@@ -332,13 +344,22 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
                 rc = grid.to_road_coords(np.array([[e.x, e.y] for e in ends]))
                 for e, (ss, dd) in zip(ends, rc):
                     hw = np.interp(ss, grid.s, grid.half_w) / cam.ppm
-                    if abs(dd) <= hw + 0.6:
+                    # on the road, and not on a vehicle ahead (white bodywork looks like paint)
+                    if abs(dd) <= hw + 0.6 and (free_s is None or ss < free_s - 0.5):
                         dets.append((float(ss), float(dd), e.kind, e.x, e.y))
+            # road-surface speed (works with or without markings)
+            d_strip = odo.update(small, free_s)          # dense: road texture just ahead
+            d_feat = gflow.update(small)                 # sparse: features over all ground
+            v_surf = _combine(d_strip * fps, d_feat * fps, recent_surf)
+            if np.isfinite(v_surf):
+                recent_surf.append(v_surf)
+            live.surface.append(v_surf)
             marking_moving = any(tr.hits >= 5 and tr.misses == 0 and -tr.x[1] > 2.0
                                  for tr in tracker.tracks)
+            marking_moving = marking_moving or (np.isfinite(v_surf) and v_surf > 2.0)
             mature = [tr for tr in tracker.tracks if tr.hits >= 10 and tr.misses == 0]
             markings_still = bool(mature) and all(abs(tr.x[1]) < 0.4 for tr in mature)
-            tracker.stationary = ego.update(bev, marking_moving, markings_still)
+            tracker.stationary = ego.update(bev, marking_moving, markings_still, gflow.image_motion)
             live.add(tracker.step(t, dets))
             for tc, k in tracker.recent_crossings:
                 flash[k] = tc
@@ -363,12 +384,13 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
     duration = fi / fps
     stationary = np.array(st_hist[:fi], bool)
     timeline = np.array(live.final[:fi], float)
-    rows = aggregate_windows(tracker.samples, timeline, stationary, fps, s.window_s)
+    rows = aggregate_windows(tracker.samples, timeline, stationary, fps, s.window_s, live.method[:fi])
 
     result = {
         "fps": round(fps, 3), "frames": fi, "duration_s": round(duration, 2),
         "calibration": calib, "settings": asdict(s), "windows": rows,
         "stationary_s": round(float(stationary.sum()) / fps, 2),
+        "surface_kmh": [None if not np.isfinite(v) else round(float(v) * 3.6, 1) for v in live.surface[:fi]],
         "timeline_kmh": [None if np.isnan(v) else round(float(v) * 3.6, 1) for v in timeline],
         "samples": [{"t": round(x.t, 3), "speed_kmh": round(x.speed_mps * 3.6, 2),
                      "track": x.track, "lines": list(x.line_pair), "dt_s": round(x.dt, 4)}
@@ -377,12 +399,32 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
     (out / "results.json").write_text(json.dumps(result, indent=2))
     with open(out / "speed_table.csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["window", "start_s", "end_s", "speed_kmh", "speed_mps", "status", "samples"])
+        w.writerow(["window", "start_s", "end_s", "speed_kmh", "speed_mps", "status", "method",
+                    "marking_samples"])
         for r in rows:
             w.writerow([r["window"], r["start_s"], r["end_s"], r["speed_kmh"], r["speed_mps"],
-                        r["status"], r["samples"]])
+                        r["status"], r["method"], r["samples"]])
     progress(1.0, "Done")
     return result
+
+
+def _combine(v_strip: float, v_feat: float, recent) -> float:
+    """Merge the two road-surface speed estimates (m/s) for one frame.
+
+    The dense strip match is the more accurate one (unbiased on clear video, a few %
+    low on very blurry/compressed video); feature tracking covers more of the picture
+    and fills the frames where the strip has nothing to lock onto.
+    """
+    ok_s = np.isfinite(v_strip) and v_strip > 0
+    ok_f = np.isfinite(v_feat) and v_feat > 0
+    ref = float(np.median(recent)) if len(recent) >= 5 else None
+    if ok_s and (ref is None or abs(v_strip - ref) <= 0.3 * ref or not ok_f):
+        return v_strip
+    if ok_f and (ref is None or abs(v_feat - ref) <= 0.3 * ref):
+        return v_feat
+    if ok_s and ok_f and abs(v_strip - v_feat) <= 0.15 * max(v_strip, v_feat):
+        return v_strip                        # both agree on a real change of speed
+    return np.nan
 
 
 def _overlay(cam, grid: RoadGrid, mmask, tracker: MarkingTracker, t, flash, free_s=None):
@@ -438,7 +480,7 @@ def _render(frame, ov, hud_lines):
         _draw_poly(vis, pts, colour, thick)
     for c in ov["dots"]:
         cv2.circle(vis, c, 4, (0, 0, 255), -1, cv2.LINE_AA)
-    cv2.rectangle(vis, (10, 10), (300, 92), (20, 20, 20), -1)
+    cv2.rectangle(vis, (10, 10), (330, 92), (20, 20, 20), -1)
     for i, txt in enumerate(hud_lines):
         cv2.putText(vis, txt, (20, 34 + 24 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1,
                     cv2.LINE_AA)

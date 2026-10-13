@@ -175,40 +175,6 @@ class MarkingTracker:
         return out
 
 
-def speed_timeline(samples: list[SpeedSample], stationary: np.ndarray, fps: float,
-                   half_window_s: float = 0.75) -> np.ndarray:
-    """Per-frame speed (m/s): 0 when stationary, otherwise the robust median of the
-    1 m crossing samples within +-half_window_s; NaN where there is no evidence."""
-    n = len(stationary)
-    out = np.full(n, np.nan)
-    if samples:
-        ts = np.array([x.t for x in samples])
-        vs = np.array([x.speed_mps for x in samples])
-        order = np.argsort(ts)
-        ts, vs = ts[order], vs[order]
-        for i in range(n):
-            t = i / fps
-            a, b = np.searchsorted(ts, [t - half_window_s, t + half_window_s])
-            if b - a >= 2:
-                v = vs[a:b]
-                med = np.median(v)
-                mad = 1.4826 * np.median(np.abs(v - med))
-                out[i] = np.median(v[np.abs(v - med) <= max(3 * mad, 0.05 * med)])
-    out[stationary] = 0.0
-    # bridge short gaps (e.g. braking at very low speed, occluded markings) linearly
-    known = np.flatnonzero(~np.isnan(out))
-    if len(known) >= 2:
-        gaps = np.flatnonzero(np.isnan(out))
-        gaps = gaps[(gaps > known[0]) & (gaps < known[-1])]
-        if len(gaps):
-            nxt = known[np.searchsorted(known, gaps)]
-            prv = known[np.searchsorted(known, gaps) - 1]
-            fill = (nxt - prv) <= 3.0 * fps
-            g = gaps[fill]
-            out[g] = np.interp(g, known, out[known])
-    return out
-
-
 def _assign(C: np.ndarray):
     """Gated greedy assignment: repeatedly take the cheapest remaining
     (track, detection) pair.  With tight gates this matches the optimal
@@ -230,16 +196,26 @@ def _assign(C: np.ndarray):
     return pairs
 
 
-def window_row(w: int, a: float, b: float, seg: np.ndarray, st: np.ndarray, n_samp: int) -> dict:
+METHOD_NAMES = {"M": "lane markings", "S": "road surface"}
+
+
+def window_row(w: int, a: float, b: float, seg: np.ndarray, st: np.ndarray, n_samp: int,
+               methods=None) -> dict:
     row = {"window": w + 1, "start_s": round(a, 2), "end_s": round(b, 2), "samples": n_samp,
-           "speed_mps": None, "speed_kmh": None, "status": "no data"}
+           "speed_mps": None, "speed_kmh": None, "status": "no data", "method": ""}
     known = seg[~np.isnan(seg)]
+    if methods is not None:
+        ms = [m for m in methods if m in METHOD_NAMES]
+        if ms:
+            nm, ns = ms.count("M"), ms.count("S")
+            row["method"] = (METHOD_NAMES["M"] if ns == 0 else METHOD_NAMES["S"] if nm == 0
+                             else "markings + surface")
     if len(seg) and st.mean() >= 0.9:
-        row.update(speed_mps=0.0, speed_kmh=0.0, status="stopped")
+        row.update(speed_mps=0.0, speed_kmh=0.0, status="stopped", method="")
     elif len(known) >= 0.5 * len(seg) and len(known):
         v = float(np.mean(known))          # time-average over the window
         status = "moving" if st.mean() < 0.1 else "stopping/starting"
-        if status == "moving" and n_samp < 4:
+        if status == "moving" and n_samp < 4 and row["method"] == METHOD_NAMES["M"]:
             status = "low data"
         row.update(speed_mps=round(v, 2), speed_kmh=round(v * 3.6, 1), status=status)
     return row
@@ -251,7 +227,7 @@ def window_bounds(w: int, window: float, duration: float, fps: float):
 
 
 def aggregate_windows(samples: list[SpeedSample], timeline: np.ndarray, stationary: np.ndarray,
-                      fps: float, window: float = 3.0):
+                      fps: float, window: float = 3.0, methods=None):
     rows = []
     duration = len(timeline) / fps
     n_win = int(np.ceil(duration / window - 1e-9))
@@ -259,12 +235,19 @@ def aggregate_windows(samples: list[SpeedSample], timeline: np.ndarray, stationa
     for w in range(max(n_win, 1)):
         a, b, fa, fb = window_bounds(w, window, duration, fps)
         n_samp = bisect.bisect_left(ts, b) - bisect.bisect_left(ts, a)
-        rows.append(window_row(w, a, b, timeline[fa:fb], stationary[fa:fb], n_samp))
+        rows.append(window_row(w, a, b, timeline[fa:fb], stationary[fa:fb], n_samp,
+                               None if methods is None else methods[fa:fb]))
     return rows
 
 
 class LiveTimeline:
-    """Incremental version of :func:`speed_timeline` (identical results).
+    """Per-frame speed, built incrementally while the video is analysed.
+
+    Frame k's speed is (in order of preference):
+      0 when the car is stopped;
+      "M": robust median of the lane-marking 1 m crossing samples within +-half s;
+      "S": robust median of the road-surface (texture) measurements within +-half s;
+      bridged linearly across short gaps; otherwise unknown.
 
     Frame k's value is final once the samples within +-half of it have all
     arrived and any gap containing it can be bridged (needs ``bridge`` s of
@@ -278,6 +261,8 @@ class LiveTimeline:
         self.vs: list[float] = []
         self.raw: list[float] = []
         self.final: list[float] = []
+        self.surface: list[float] = []      # per-frame road-surface speed (m/s) or NaN
+        self.method: list[str] = []         # per-frame source: Z(stopped) M S I(bridged) 
         self.last_known: int | None = None
         self.bridge_frames = bridge * fps
 
@@ -287,20 +272,37 @@ class LiveTimeline:
             self.ts.insert(i, x.t)
             self.vs.insert(i, x.speed_mps)
 
-    def _raw_value(self, k: int) -> float:
+    @staticmethod
+    def _robust(v: np.ndarray) -> float:
+        med = np.median(v)
+        mad = 1.4826 * np.median(np.abs(v - med))
+        return float(np.median(v[np.abs(v - med) <= max(3 * mad, 0.05 * abs(med))]))
+
+    def _raw_value(self, k: int):
         t = k / self.fps
         a = bisect.bisect_left(self.ts, t - self.half)
         b = bisect.bisect_left(self.ts, t + self.half)
-        if b - a < 2:
-            return np.nan
-        v = np.array(self.vs[a:b])
-        med = np.median(v)
-        mad = 1.4826 * np.median(np.abs(v - med))
-        return float(np.median(v[np.abs(v - med) <= max(3 * mad, 0.05 * med)]))
+        n_mark = b - a
+        if n_mark >= 4:                     # real dashed markings: the primary method
+            return self._robust(np.array(self.vs[a:b])), "M"
+        h = int(round(self.half * self.fps))
+        seg = np.array(self.surface[max(k - h, 0):k + h + 1], float)
+        ok = seg[np.isfinite(seg)]
+        if len(ok) >= max(3, 0.35 * len(seg)):
+            return self._robust(ok), "S"
+        if n_mark >= 2:                     # a few marking crossings, no surface reading
+            return self._robust(np.array(self.vs[a:b])), "M"
+        return np.nan, ""
 
     def compute_raw(self, upto: int, stationary: list[bool]):
         for k in range(len(self.raw), upto + 1):
-            self.raw.append(0.0 if stationary[k] else self._raw_value(k))
+            if stationary[k]:
+                self.raw.append(0.0)
+                self.method.append("Z")
+            else:
+                v, m = self._raw_value(k)
+                self.raw.append(v)
+                self.method.append(m)
 
     def finalize(self, upto: int, complete: bool = False) -> int:
         """Finalise frames while possible (all of them when ``complete``)."""
@@ -328,6 +330,7 @@ class LiveTimeline:
                 break                       # not decidable yet: wait for more frames
             if nxt is not None:
                 self.final.append(self.raw[prv] + (self.raw[nxt] - self.raw[prv]) * (j - prv) / (nxt - prv))
+                self.method[j] = "I"
             else:
                 self.final.append(np.nan)
         return len(self.final)

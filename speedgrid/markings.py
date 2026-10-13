@@ -28,7 +28,8 @@ class MarkingEnd:
     comp: int         # component id in this frame
 
 
-def detect_markings(bev_bgr: np.ndarray, cam: CameraModel, road_mask: np.ndarray | None):
+def detect_markings(bev_bgr: np.ndarray, cam: CameraModel, road_mask: np.ndarray | None,
+                    stats_mask: np.ndarray | None = None):
     ppm = cam.ppm
     Hb, Wb = bev_bgr.shape[:2]
     valid = cam.valid_bev_mask()
@@ -41,7 +42,10 @@ def detect_markings(bev_bgr: np.ndarray, cam: CameraModel, road_mask: np.ndarray
     if road_mask is not None:
         grow = cv2.getStructuringElement(cv2.MORPH_RECT, (int(1.0 * ppm) | 1, 3))
         region = cv2.bitwise_and(valid, cv2.dilate(road_mask, grow))
-    hist = cv2.calcHist([tophat], [0], region, [256], [0, 256]).ravel()
+    # threshold statistics from the road surface itself (a textured verge inside a wide
+    # search area would otherwise raise the threshold and hide thin edge lines)
+    stat_region = region if stats_mask is None else cv2.bitwise_and(valid, stats_mask)
+    hist = cv2.calcHist([tophat], [0], stat_region, [256], [0, 256]).ravel()
     if hist.sum() < 100:
         return np.zeros((Hb, Wb), np.uint8), []
     # median / MAD from the histogram (tophat is uint8): no sorting needed
@@ -81,6 +85,8 @@ def detect_markings(bev_bgr: np.ndarray, cam: CameraModel, road_mask: np.ndarray
         if long_side < min_len or short_side > 0.6 * ppm or long_side < 2.5 * short_side:
             continue
         accept[i] = 255
+        if long_side > 7.0 * ppm:
+            continue        # a solid line: its "ends" are just where detection fades - not real
         # Endpoints along the road direction (BEV y).  Clipped ends are useless.
         for kind, yy in (("far", ys.min()), ("near", ys.max())):
             row_x = xs[ys == yy]

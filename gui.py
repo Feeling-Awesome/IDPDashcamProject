@@ -206,13 +206,13 @@ class App:
         body.add(left, weight=3)
 
         right = ttk.Frame(body, padding=(10, 0, 0, 0))
-        cols = ("win", "time", "kmh", "status", "n")
+        cols = ("win", "time", "kmh", "status", "method")
         self.table = ttk.Treeview(right, columns=cols, show="headings", height=18, selectmode="browse")
         for c, txt, w, anchor in (("win", "#", 36, "e"), ("time", "Time (s)", 92, "e"),
                                   ("kmh", "km/h", 64, "e"), ("status", "Status", 120, "w"),
-                                  ("n", "Samples", 64, "e")):
+                                  ("method", "Measured from", 150, "w")):
             self.table.heading(c, text=txt, anchor=anchor)
-            self.table.column(c, width=w, anchor=anchor, stretch=(c == "status"))
+            self.table.column(c, width=w, anchor=anchor, stretch=(c == "method"))
         sb = ttk.Scrollbar(right, orient="vertical", command=self.table.yview)
         self.table.configure(yscrollcommand=sb.set)
         self.table.bind("<<TreeviewSelect>>", self._on_row)
@@ -363,14 +363,18 @@ class App:
             kmh = "—" if r["speed_kmh"] is None else f"{r['speed_kmh']:.1f}"
             self.table.insert("", "end", iid=str(r["window"]),
                               values=(r["window"], f"{r['start_s']:.0f}–{r['end_s']:.0f}", kmh,
-                                      r["status"], r["samples"]))
+                                      r["status"], r.get("method", "")))
         c = res["calibration"]
         moving = [r["speed_kmh"] for r in res["windows"] if r["speed_kmh"]]
         avg = f"Average while moving: {np.mean(moving):.1f} km/h. " if moving else ""
+        hint = ("" if c.get("scale_factor") else
+                " No lane pair to auto-scale from on this road: use Calibrate… once with a known "
+                "speed for exact values.")
         self.summary.configure(
             text=f"{avg}Stopped for {res['stationary_s']:.0f} s of {res['duration_s']:.0f} s. "
                  f"Camera height {c['camera_height_m']} m"
-                 f"{' (auto-scaled)' if c.get('scale_factor') else ''}, horizon {c['vanishing_point']}.")
+                 f"{' (auto-scaled from lane width)' if c.get('scale_factor') else ' (assumed)'}, "
+                 f"horizon {c['vanishing_point']}.{hint}")
         for b in (self.save_vid_btn, self.save_csv_btn, self.folder_btn, self.calib_btn):
             b.configure(state="normal")
         self._open_player(self.out_dir / "annotated.mp4")

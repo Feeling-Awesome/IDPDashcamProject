@@ -19,9 +19,10 @@ def main():
     s = Settings(hfov_deg=a.hfov, cam_height_m=a.height, lane_width_m=a.lane_width or None,
                  horizon_frac=a.horizon, bonnet_frac=a.bonnet, grid_lines=a.grid_lines, window_s=a.window)
     res = process_video(a.video, a.out, s, progress=lambda p, m: None)
-    print(f"{'win':>4} {'start':>6} {'end':>6} {'km/h':>7} {'n':>4}")
+    print(f"{'win':>4} {'start':>6} {'end':>6} {'km/h':>7}  {'status':<18} measured from")
     for r in res["windows"]:
-        print(f"{r['window']:>4} {r['start_s']:>6} {r['end_s']:>6} {str(r['speed_kmh']):>7} {r['samples']:>4}")
+        print(f"{r['window']:>4} {r['start_s']:>6} {r['end_s']:>6} {str(r['speed_kmh']):>7}  "
+              f"{r['status']:<18} {r.get('method', '')}")
 
 
 if __name__ == "__main__":

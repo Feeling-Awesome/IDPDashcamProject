@@ -50,7 +50,8 @@ class EgoMotion:
         hp = g - cv2.GaussianBlur(g, (0, 0), 3.0)     # keep texture, drop shading
         return hp
 
-    def update(self, bev_bgr, marking_moving: bool, markings_still: bool = False) -> bool:
+    def update(self, bev_bgr, marking_moving: bool, markings_still: bool = False,
+               image_motion: float = float("nan")) -> bool:
         cur = self._patch(bev_bgr)
         still = False
         shift = np.nan
@@ -68,6 +69,14 @@ class EgoMotion:
 
         # lane markings that are tracked but not moving are independent evidence
         still = still or markings_still
+        # ...but the picture as a whole must not be moving: tracked feature points
+        # across the ground/roadside barely move when the car really stands still.
+        # (Blurry or heavily compressed video can make the road patch look static.)
+        if np.isfinite(image_motion):
+            if image_motion > 0.6:
+                still = False
+            elif image_motion < 0.25 and markings_still:
+                still = True
         if still and not marking_moving:
             self.still_run += 1
             self.move_run = 0

@@ -25,6 +25,7 @@ class RoadModel:
         self.mean = None          # Lab colour mean of asphalt
         self.cov = None
         self.params = None        # [a, b, c_left, c_right]  (shared-shape edge model)
+        self.line_lock = {"l": 0, "r": 0}
         self.misses = 0
         self.mask = None
         self.ok = False
@@ -54,7 +55,8 @@ class RoadModel:
             self.cov = (1 - rate) * self.cov + rate * c
 
     # --------------------------------------------------------------- per frame
-    def update(self, bev_bgr: np.ndarray, marking_mask: np.ndarray | None = None):
+    def update(self, bev_bgr: np.ndarray, marking_mask: np.ndarray | None = None,
+               line_mask: np.ndarray | None = None):
         cam = self.cam
         F = self.F
         Wb, Hb = cam.bev_size
@@ -80,7 +82,7 @@ class RoadModel:
 
         # Mahalanobis distance to the asphalt model (L weighted down for shadows),
         # computed as ||A (x - mean)||^2 with A^T A = inverse covariance
-        wgt = np.diag([0.35, 1.0, 1.0])
+        wgt = np.diag([0.25, 1.0, 1.0])   # brightness matters less than colour (worn/patched asphalt)
         icov = np.linalg.inv(wgt @ self.cov @ wgt)
         A = (np.linalg.cholesky(icov).T @ wgt).astype(np.float32)
         diff = cv2.subtract(lab, tuple(float(v) for v in self.mean) + (0.0,), dtype=cv2.CV_32F)
@@ -117,9 +119,21 @@ class RoadModel:
             inner[: h // 2] = False
             self._update_colour(lab, inner, 0.12)
 
-        self._fit_edges(road, valid)
+        # long solid painted lines (edge lines): the best evidence of where the road ends
+        lines = None
+        src = line_mask if line_mask is not None else marking_mask
+        if src is not None:
+            mm = cv2.resize(src, (w, h), interpolation=cv2.INTER_NEAREST)
+            n, lbl, st, _ = cv2.connectedComponentsWithStats(mm, 8)
+            long_ids = np.flatnonzero(st[:, cv2.CC_STAT_HEIGHT] >= 5.0 * ppm)
+            long_ids = long_ids[long_ids > 0]
+            if len(long_ids):
+                lut = np.zeros(n, np.uint8)
+                lut[long_ids] = 255
+                lines = lut[lbl] > 0
+        self._fit_edges(road, valid, lines)
 
-    def _fit_edges(self, road: np.ndarray, valid: np.ndarray):
+    def _fit_edges(self, road: np.ndarray, valid: np.ndarray, lines: np.ndarray | None = None):
         """Joint parallel-edge fit:  x_left(u) = a u^2 + b u + cl,  x_right(u) = a u^2 + b u + cr
         with u = distance up the BEV (0 = nearest row, 1 = far end).
 
@@ -165,6 +179,40 @@ class RoadModel:
         l_ok = (l > 1) & V[np.arange(len(rows)), np.clip(l - 2, 0, w - 1)]
         r_ok = (r < w - 2) & V[np.arange(len(rows)), np.clip(r + 2, 0, w - 1)]
         xl, xr = (l.astype(float) + 0.5) * F, (r.astype(float) + 0.5) * F
+
+        # Snap to solid edge lines: if a long painted line runs within a few metres
+        # of the colour edge (outside it, or just inside), the line is the road edge.
+        # Fixes two-tone / worn roads where colour alone finds only part of the road.
+        snap_l = np.zeros(len(rows), bool)
+        snap_r = np.zeros(len(rows), bool)
+        if lines is not None:
+            L = lines[rows]
+            out_m, in_m = 4.5 * ppm / F, 1.0 * ppm / F
+            for i in range(len(rows)):
+                cols_i = np.flatnonzero(L[i])
+                if len(cols_i) == 0 or not inside[i]:
+                    continue
+                cl = cols_i[(cols_i >= l[i] - out_m) & (cols_i <= l[i] + in_m) & (cols_i < c[i])]
+                if len(cl):
+                    xl[i] = (cl.min() + 0.5) * F
+                    l_ok[i] = snap_l[i] = True
+                cr = cols_i[(cols_i <= r[i] + out_m) & (cols_i >= r[i] - in_m) & (cols_i > c[i])]
+                if len(cr):
+                    xr[i] = (cr.max() + 0.5) * F
+                    r_ok[i] = snap_r[i] = True
+            width_ok = width_ok | ((xr - xl) >= 2.5 * ppm)
+            # where a side is mostly defined by a painted line, use only the line
+            # (mixing line rows and colour rows would look like a sideways jump)
+        # once a side has been found on a painted line, stay on it for a while: on frames
+        # where the line isn't detected, treat that side as unseen (the model holds it)
+        # rather than falling back to a colour edge that may be inside the road
+        for side, snap, okv in (("l", snap_l, l_ok), ("r", snap_r, r_ok)):
+            if snap.sum() >= 0.3 * max(inside.sum(), 1):
+                okv &= snap
+                self.line_lock[side] = 45
+            elif self.line_lock[side] > 0:
+                self.line_lock[side] -= 1
+                okv[:] = False
 
         jump, gate = 0.45 * ppm, 1.2 * ppm
         ok_l = inside & width_ok & l_ok
