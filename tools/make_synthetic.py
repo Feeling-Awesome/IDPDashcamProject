@@ -68,7 +68,7 @@ def draw_traffic(img, cam, t, s_car, v):
 
 
 def load_sprites(paths):
-    """Car photos (rear views) used as other traffic; physical width assumed 1.85 m."""
+    """Car photos used as other traffic; each photo's box is taken to be 1.45 m tall."""
     out = []
     for p in paths:
         img = cv2.imread(p)
@@ -78,12 +78,24 @@ def load_sprites(paths):
     return out
 
 
-# other traffic for --traffic: lane offset (m), absolute speed (km/h), start distance ahead (m), sprite
-TRAFFIC = [
-    {"id": 1, "d": 3.5, "kmh": 100.0, "z0": 9.0, "sprite": 1},     # right lane, faster than us
-    {"id": 2, "d": -3.5, "kmh": 70.0, "z0": 55.0, "sprite": 0},    # left lane, we overtake it
-    {"id": 3, "d": 0.0, "kmh": None, "z0": 24.0, "sprite": 0},     # our lane: same speed as us + 8
-]
+# other traffic for --traffic: lateral offset (m), absolute speed (km/h, None = ours + 8),
+# start distance ahead (m), sprite index
+TRAFFIC = {
+    "highway": [
+        {"id": 1, "d": 3.5, "kmh": 100.0, "z0": 9.0, "sprite": 1},     # right lane, faster than us
+        {"id": 2, "d": -3.5, "kmh": 70.0, "z0": 55.0, "sprite": 0},    # left lane, we overtake it
+        {"id": 3, "d": 0.0, "kmh": None, "z0": 24.0, "sprite": 0},     # our lane: our speed + 8
+    ],
+    # pulling away from a junction: two cars parked sideways on the cross street (speed 0)
+    # to the right, one car moving ahead of us (sprite 2 = side view)
+    "junction": [
+        {"id": 1, "d": 8.5, "kmh": 0.0, "z0": 26.0, "sprite": 2},
+        {"id": 2, "d": -13.0, "kmh": 0.0, "z0": 22.0, "sprite": 2},
+        {"id": 3, "d": 0.0, "kmh": None, "z0": 14.0, "sprite": 0},
+        {"id": 4, "d": -9.0, "kmh": 0.0, "z0": 38.0, "sprite": 1},
+    ],
+}
+CAR_HEIGHT_M = 1.45
 
 
 def draw_sprites(img, cam, cars, sprites):
@@ -94,13 +106,16 @@ def draw_sprites(img, cam, cars, sprites):
         z = c["z"]
         if z < 2.5 or z > 150:
             continue
-        sp = sprites[c["sprite"]]
-        p = cam.project_3d(np.array([c["d"] - 0.925, c["d"] + 0.925]), np.zeros(2), np.array([z, z]))
-        w = p[1, 0] - p[0, 0]
-        if not np.all(np.isfinite(p)) or w < 4:
+        sp = sprites[c["sprite"] % len(sprites)]
+        # bottom-centre on the road, height CAR_HEIGHT_M (the photo's car fills it, ~3 px margin)
+        p = cam.project_3d(np.array([c["d"], c["d"]]), np.array([0.0, CAR_HEIGHT_M]), np.array([z, z]))
+        if not np.all(np.isfinite(p)):
             continue
-        h = w * sp.shape[0] / sp.shape[1]
-        x0, y1 = p[0, 0], (p[0, 1] + p[1, 1]) / 2 + 2 * w / sp.shape[1]     # sprite has a 2 px margin below
+        h = (p[0, 1] - p[1, 1]) * sp.shape[0] / max(sp.shape[0] - 6, 1)
+        w = h * sp.shape[1] / sp.shape[0]
+        if w < 4:
+            continue
+        x0, y1 = p[0, 0] - w / 2, p[0, 1] + 3 * h / sp.shape[0]
         xi0, yi0 = int(round(x0)), int(round(y1 - h))
         wi, hi = max(int(round(w)), 2), max(int(round(h)), 2)
         spr = cv2.resize(sp, (wi, hi), interpolation=cv2.INTER_AREA)
@@ -135,6 +150,7 @@ def main():
     ap.add_argument("--bounce", type=float, default=0.0, help="pitch bounce amplitude (deg)")
     ap.add_argument("--traffic", nargs="*", default=None,
                     help="car sprite images: add other cars with known speeds (ground truth in .truth.json)")
+    ap.add_argument("--traffic-scene", choices=sorted(TRAFFIC), default="highway")
     ap.add_argument("--degrade", action="store_true",
                     help="motion blur + 854x480 heavy compression (like a re-uploaded web video)")
     args = ap.parse_args()
@@ -197,7 +213,7 @@ def main():
     s_car = 0.0
     truth = []
     sprites = load_sprites(args.traffic) if args.traffic else None
-    others = [dict(c, s=c["z0"]) for c in TRAFFIC] if sprites else []
+    others = [dict(c, s=c["z0"]) for c in TRAFFIC[args.traffic_scene]] if sprites else []
     for i in range(n):
         t = i * dt
         if args.stopgo:

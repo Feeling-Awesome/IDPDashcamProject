@@ -329,6 +329,20 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
                                   live.method[fa:fb])
         return rows_done[w]
 
+    def ego_smooth(j):
+        """Our speed at frame j for the vehicle speeds: a straight-line fit over the last
+        second of final values (removes frame-to-frame jitter without lagging when we
+        speed up or slow down); 0 when stopped."""
+        if st_hist[j]:
+            return 0.0
+        a = max(0, j - int(round(fps)))
+        seg = np.array(live.final[a:j + 1], float)
+        k = np.flatnonzero(np.isfinite(seg))
+        if len(k) < 3:
+            return float(live.final[j])
+        fit = np.polyfit(k - (j - a), seg[k], 1)
+        return float(max(np.polyval(fit, 0.0), 0.0))
+
     def flush(upto_final):
         while pending and pending[0][0] < upto_final:
             j, small, ov = pending.popleft()
@@ -349,8 +363,7 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
                 win_txt = f"window {row['window']}: {row['speed_kmh']:5.1f} km/h"
             vehs = None
             if veh is not None:
-                ego_v = 0.0 if st_hist[j] else v
-                vehs = veh.boxes_at(j, frame_t[j], ego_v, hold_frames=2 * det_every)
+                vehs = veh.boxes_at(j, frame_t[j], ego_smooth(j), hold_frames=2 * det_every)
             vis = _render(small, ov, [f"t = {t:6.2f} s", speed_txt, win_txt], vehs)
             writer.write(vis)
             state["written"] += 1
@@ -487,7 +500,7 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
     result = {
         "fps": round(fps, 3), "frames": fi, "duration_s": round(duration, 2),
         "calibration": calib, "settings": asdict(s), "windows": rows,
-        "vehicles": veh.summary(lambda tt: float(timeline[min(bisect.bisect_left(frame_t, tt), fi - 1)]))
+        "vehicles": veh.summary(lambda tt: ego_smooth(min(bisect.bisect_left(frame_t, tt), fi - 1)))
                     if veh is not None else [],
         "stationary_s": round(float(stationary.sum()) / fps, 2),
         "surface_kmh": [None if not np.isfinite(v) else round(float(v) * 3.6, 1) for v in live.surface[:fi]],

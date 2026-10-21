@@ -5,15 +5,20 @@
   second.  Only cars, trucks, buses and motorbikes are kept.
 * Tracking: boxes are linked over time by overlap with each track's predicted
   box (greedy, best overlap first).
-* Distance: the bottom-centre of a box is where the vehicle touches the road.
-  Mapping it through the same flat-road camera model as the 1 m grid gives its
-  distance along the road in grid metres.  Far away that is coarse (one pixel
-  is over a metre at 30 m), so it is fused with a distance from the box width
-  (width x distance is constant for one vehicle), each weighted by its own
-  expected error.
-* Speed: a weighted straight-line fit of distance against time over about
-  +-1 s gives how fast the vehicle moves across the grid lines relative to us;
-  adding our own (ego) speed makes it absolute.
+* Distance, two independent ways:
+    - road contact: the bottom-centre of a box is where the vehicle touches the
+      road; the same flat-road camera model as the 1 m grid turns it into grid
+      metres.  Near the horizon this hinges on knowing exactly where the horizon
+      is (a few pixels off makes a car 30 m away look 17 m away);
+    - size: a car is about 1.55 m tall whichever way it faces, so box height
+      gives distance with no horizon at all (about +-12 %).
+  Each is weighted by its expected error, including the horizon uncertainty.
+* Relative speed, two ways over about +-1 s:
+    - the road-contact distance against time, corrected for the fused distance
+      (a horizon error scales that rate by (true / estimated distance)^2);
+    - how fast the box grows: d(ln size)/dt = -(dZ/dt) / Z, times the fused
+      distance (error only proportional to the distance error).
+  Absolute speed = our (ego) speed + relative speed.
 """
 from __future__ import annotations
 
@@ -28,6 +33,8 @@ from .camera import CameraModel
 
 MODEL_PATH = Path(__file__).resolve().parent / "models" / "yolox_s.onnx"
 VEHICLE_CLASSES = {2: "car", 3: "motorbike", 5: "bus", 7: "truck"}
+# typical box height (m) and its relative spread per class (box = ground to roof)
+HEIGHT_PRIOR = {"car": (1.55, 0.12), "motorbike": (1.45, 0.15), "bus": (3.1, 0.12), "truck": (2.8, 0.40)}
 _STRIDES = (8, 16, 32)
 
 
@@ -124,7 +131,8 @@ class VehicleSpeeds:
     """Tracks vehicles over the video and answers 'which boxes and speeds on frame j'."""
 
     def __init__(self, cam: CameraModel, fps: float, speedup: float = 1.0, max_dist_m: float = 80.0,
-                 half_window_s: float = 1.0, px_noise: float = 1.5, max_sd_kmh: float = 6.0):
+                 half_window_s: float = 1.0, px_noise: float = 1.5, max_sd_kmh: float = 6.0,
+                 horizon_sd_frac: float = 0.012):
         self.cam = cam
         self.fps = fps
         self.sp = max(float(speedup or 1.0), 0.01)
@@ -132,12 +140,14 @@ class VehicleSpeeds:
         self.half = half_window_s
         self.px_noise = px_noise
         self.max_sd_kmh = max_sd_kmh
+        self.horizon_sd = horizon_sd_frac * cam.height      # how far off the horizon may be (px)
         self.tracks: list[VehicleTrack] = []
         self.done: list[VehicleTrack] = []
         self.next_id = 1
         H = cam.height
         self.horizon_y = float((cam.G2I @ np.array([0.0, 1e6, 1.0]))[1] / (cam.G2I @ np.array([0.0, 1e6, 1.0]))[2])
         self.bottom_y = H * (1.0 - cam.bonnet_frac) - 3
+        self.band_top = max(self.horizon_y - 0.22 * H, 0.0)
 
     # ------------------------------------------------------------- detection side
     def band(self) -> tuple[int, int]:
@@ -252,44 +262,108 @@ class VehicleSpeeds:
         return r if with_sd else r[:2]
 
     def _relative(self, tr: VehicleTrack, t: float, half: float):
-        """(relative speed in m/s of on-screen time, distance in m) at time t, NaN if unknown.
-        Positive = moving away from us (faster than us).
-
-        Two independent estimates over the same +-1 s window, combined by their errors:
-          * the road-contact distance (bottom of the box, grid metres) against time;
-          * the rate of growth of the box width: d(ln w)/dt = -(dZ/dt) / Z.
-        Width is only used for boxes that are not cut by the frame edge.
-        """
+        """(relative speed in m/s of on-screen time, distance in m, sd of the speed) at time t;
+        NaN if unknown.  Positive = moving away from us (faster than us).  See module doc."""
         nan = (np.nan, np.nan, np.nan)
         obs = [o for o in tr.obs if abs(o.t - t) <= half]
         if len(obs) < 4:
             return nan
-        f, h, s = self.cam.focal, self.cam.cam_height_m, self.px_noise
-        W = self.cam.width
+        f, hc, s = self.cam.focal, self.cam.cam_height_m, self.px_noise
+        W, v0 = self.cam.width, self.horizon_y
         ts = np.array([o.t for o in obs])
         zb = np.array([o.z for o in obs])
+        b = np.array([o.box for o in obs], float)
+        hpx, wpx = b[:, 3] - b[:, 1], b[:, 2] - b[:, 0]
+        bottom_ok = b[:, 3] < self.bottom_y - 2
+        top_ok = b[:, 1] > self.band_top + 2
+        whole = bottom_ok & top_ok & (b[:, 0] > 3) & (b[:, 2] < W - 4)
+
+        # --- distance at t: road contact (horizon-dependent) and size (horizon-free)
         ok = np.isfinite(zb)
-        fb = self._wfit(ts[ok], zb[ok], zb[ok] ** 2 / (f * h) * s + 0.05, t) if ok.sum() >= 3 else None
-        if fb is None:
+        fb = self._wfit(ts[ok], zb[ok], zb[ok] ** 2 / (f * hc) * s + 0.05, t) if ok.sum() >= 3 else None
+        ests, wts = [], []
+        z_b0 = z_s0 = np.nan
+        frac_b = np.nan
+        if fb is not None and fb[1] > 0.5:
+            v_b, z_b0, sd_vb = fb
+            dy = max(f * hc / z_b0, 1.0)                    # contact row below the horizon (px)
+            frac_b = float(np.hypot(self.horizon_sd / dy, 0.03))   # relative error from the horizon
+        hp, hsd = HEIGHT_PRIOR.get(tr.kind, HEIGHT_PRIOR["car"])
+        hz = bottom_ok & top_ok & (hpx > 6)
+        if hz.sum() >= 3:
+            z_s0 = float(np.median(f * hp / hpx[hz]))
+        if np.isfinite(z_b0) and np.isfinite(z_s0):
+            # if the two disagree by more than their errors allow, the road isn't flat out
+            # there (junction, hill, nose-up while accelerating): the road-contact distance
+            # is then at least as uncertain as the disagreement
+            d = abs(np.log(z_b0 / z_s0))
+            if d > 2 * np.hypot(frac_b, hsd):
+                frac_b = max(frac_b, 1.5 * d)
+        if np.isfinite(z_b0):
+            ests.append(z_b0)
+            wts.append(1 / (z_b0 * frac_b) ** 2)
+        if np.isfinite(z_s0):
+            ests.append(z_s0)
+            wts.append(1 / (z_s0 * hsd) ** 2)
+        if not ests:
             return nan
-        v_b, z0, sd_b = fb
-        if not (0.5 < z0 < self.max_dist):
-            return np.nan, z0, np.nan
-        whole = np.array([o.box[0] > 3 and o.box[2] < W - 4 and o.box[3] < self.bottom_y - 2 for o in obs])
-        w = np.array([o.box[2] - o.box[0] for o in obs], float)
-        est, wgt = [v_b], [1 / sd_b ** 2]
+        Z0 = float(np.dot(ests, wts) / np.sum(wts))
+        sd_Z0 = float(1 / np.sqrt(np.sum(wts)))
+        if not (0.5 < Z0 < self.max_dist):
+            return np.nan, Z0, np.nan
+
+        # --- relative speed: contact-distance rate (rescaled) and box growth
+        vs, vw = [], []
+        if fb is not None and np.isfinite(z_b0) and z_b0 > 0.5:
+            k = (Z0 / z_b0) ** 2                            # undo the horizon error's effect on the rate
+            v1 = v_b * k
+            sys_ = abs(v1) * 2 * (sd_Z0 / Z0)               # what remains uncertain in that rescaling
+            vs.append(v1)
+            vw.append(1 / (np.hypot(sd_vb * k, sys_) + 1e-3) ** 2)
+        g_parts, g_w = [], []
+        if (hz & whole).sum() >= 4:
+            fh = self._wfit(ts[hz & whole], np.log(hpx[hz & whole]), s / hpx[hz & whole], t)
+            if fh is not None:
+                g_parts.append(fh[0])
+                g_w.append(1 / max(fh[2], 0.015) ** 2)      # box height: stable with viewing angle
         if whole.sum() >= 4:
-            fw = self._wfit(ts[whole], np.log(w[whole]), s / w[whole], t)
+            fw = self._wfit(ts[whole], np.log(wpx[whole]), s / wpx[whole], t)
             if fw is not None:
-                g, _, sd_g = fw
-                # the box shape changes slowly with viewing angle: floor the error at 2 %/s
-                est.append(-z0 * g)
-                wgt.append(1 / (z0 * max(sd_g, 0.02)) ** 2)
-        v = float(np.dot(est, wgt) / np.sum(wgt))
-        return v, z0, float(1 / np.sqrt(np.sum(wgt)))
+                g_parts.append(fw[0])
+                g_w.append(1 / max(fw[2], 0.03) ** 2)       # box width changes with viewing angle
+        if g_parts:
+            g = float(np.dot(g_parts, g_w) / np.sum(g_w))
+            sd_g = float(1 / np.sqrt(np.sum(g_w)))
+            v2 = -Z0 * g
+            vs.append(v2)
+            vw.append(1 / (np.hypot(Z0 * sd_g, abs(v2) * sd_Z0 / Z0) + 1e-3) ** 2)
+        if not vs:
+            return np.nan, Z0, np.nan
+        v = float(np.dot(vs, vw) / np.sum(vw))
+        return v, Z0, float(1 / np.sqrt(np.sum(vw)))
+
+    def speed_at(self, tr: VehicleTrack, t: float, ego_mps: float):
+        """What to show for a vehicle at time t: (km/h or NaN, distance m, sd km/h, raw km/h).
+
+        Absolute speed = our speed + its relative speed.  Shown only when its estimated
+        error is small; a reading within its own error of 0 is shown as 0 (a parked car
+        must read 0, not "4 km/h"); "oncoming" (negative) only when clearly so."""
+        rel, dist, sd = self.relative_speed(tr, t, with_sd=True)
+        if not (np.isfinite(rel) and np.isfinite(ego_mps)):
+            return np.nan, dist, np.nan, np.nan
+        raw = (ego_mps + rel / self.sp) * 3.6
+        sd_k = sd / self.sp * 3.6
+        if not (np.isfinite(sd_k) and sd_k <= self.max_sd_kmh) or (np.isfinite(dist) and dist > self.max_dist):
+            return np.nan, dist, sd_k, raw
+        kmh = raw
+        if abs(kmh) < max(3.0, 1.5 * sd_k):
+            kmh = 0.0
+        elif kmh < 0 and kmh > -max(15.0, 3.0 * sd_k):
+            kmh = -kmh                         # not clearly coming towards us: just slow
+        return kmh, dist, sd_k, raw
 
     def boxes_at(self, j: int, t: float, ego_mps: float, hold_frames: int):
-        """Vehicles to draw on frame j: (box, absolute km/h or NaN, distance m, track id)."""
+        """Vehicles to draw on frame j: (box, km/h to show or NaN, distance m, track id)."""
         out = []
         for tr in self.all_tracks():
             if len(tr.obs) < 2 or j < tr.obs[0].fi or j > tr.obs[-1].fi + hold_frames:
@@ -304,13 +378,10 @@ class VehicleSpeeds:
                 box = a.box + (b.box - a.box) * u
             else:
                 box = tr.obs[-1].box
-            rel, dist, sd = self.relative_speed(tr, t, with_sd=True)
+            kmh, dist, _, _ = self.speed_at(tr, t, ego_mps)
             if np.isfinite(dist) and dist > self.max_dist:
                 continue
-            if not (np.isfinite(sd) and sd / self.sp * 3.6 <= self.max_sd_kmh):
-                rel = np.nan                       # too uncertain to print: box only
-            v = ego_mps + rel / self.sp if (np.isfinite(rel) and np.isfinite(ego_mps)) else np.nan
-            out.append((box, v * 3.6 if np.isfinite(v) else np.nan, dist, tr.tid))
+            out.append((box, kmh, dist, tr.tid))
         return out
 
     def summary(self, ego_at) -> list[dict]:
@@ -322,13 +393,11 @@ class VehicleSpeeds:
             ts = [o.t for o in tr.obs]
             sp, samples = [], []
             for o in tr.obs:
-                rel, dist, sd = self.relative_speed(tr, o.t, with_sd=True)
-                e = ego_at(o.t)
-                if (np.isfinite(rel) and np.isfinite(e) and dist <= self.max_dist
-                        and sd / self.sp * 3.6 <= self.max_sd_kmh):
-                    sp.append((e + rel / self.sp) * 3.6)
-                    samples.append({"t": round(o.t, 3), "speed_kmh": round(sp[-1], 1),
-                                    "distance_m": round(dist, 1),
+                kmh, dist, sd_k, raw = self.speed_at(tr, o.t, ego_at(o.t))
+                if np.isfinite(kmh):
+                    sp.append(kmh)
+                    samples.append({"t": round(o.t, 3), "speed_kmh": round(kmh, 1), "raw_kmh": round(raw, 1),
+                                    "sd_kmh": round(sd_k, 1), "distance_m": round(dist, 1),
                                     "box": [int(round(c)) for c in o.box]})
             res.append({"id": tr.tid, "type": tr.kind, "first_s": round(ts[0], 2), "last_s": round(ts[-1], 2),
                         "speed_kmh_median": round(float(np.median(sp)), 1) if sp else None,
