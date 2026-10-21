@@ -29,12 +29,16 @@ grain, the verge) moves across the grid between frames. The table says which was
 4. **Fast-forwarded video?** If a clip was sped up (common for road-trip videos online),
    the app warns you (on-screen speeds of 200+ km/h). Set *Settings → Video sped up ×*
    (e.g. 3) and analyse again to get the real speed.
-5. **Calibrate… (do this once per dashcam).** Every speed scales with the camera's
+5. **Other vehicles.** In the analysed video every car, truck, bus or motorbike gets a
+   magenta rectangle with its **absolute speed** on a tag above it (not in the table).
+   A box without a number means the vehicle is too far, or only partly in view, for a
+   reliable speed. Untick *Settings → Show other vehicles' speeds* to skip this (faster).
+6. **Calibrate… (do this once per dashcam).** Every speed scales with the camera's
    field of view. Pick a stretch where you know the real speed (speedometer, GPS,
    cruise control), enter it, and the app corrects the field of view, remembers it,
    and can re-analyse. Lane-width auto-scaling handles the camera height for you.
 
-Command line (no window): `python cli.py video.mp4 --hfov 110`
+Command line (no window): `python cli.py video.mp4 --hfov 110` (add `--no-vehicles` to skip other vehicles)
 
 ## How it works
 
@@ -58,6 +62,7 @@ Command line (no window): `python cli.py video.mp4 --hfov 110`
 | Fusion | Per moment: dash crossings of the grid lines (≥ 4 within ±0.75 s; the pattern match wins if they disagree by > 20 %), else dashed-line pattern motion, else road surface, else a few crossings; the window widens to ±1.5 s when evidence is sparse; stopped = 0 |
 | Edge lines | Paint is searched up to 5 m beyond the colour-based road edge; a long solid line there becomes the grid edge (fixes two-tone / worn roads), and the edge stays locked to it through frames where the line isn't seen |
 | Crossing validation | A pair of crossings only counts if both happen within 0.6 s, the marking is moving, and the result agrees with its Kalman velocity (±35 %); nothing is counted while stopped |
+| Other vehicles | **YOLOX-S** detector (OpenCV DNN, COCO cars/trucks/buses/motorbikes) ~4× per second on the road band, plus a zoomed pass round the vanishing point cut from the full-resolution frame for far vehicles; boxes linked over time by overlap with each track's predicted box. Distance = where the box's bottom edge touches the road, through the same ground-plane homography as the 1 m grid; relative speed = weighted straight-line fit of that distance over ±1 s (±1.5 s for far vehicles), fused with the box's growth rate (d ln w/dt = −v/Z) for whole boxes. **Absolute speed = our speed + relative speed.** A number is only printed when its estimated error is ≤ 6 km/h; grid and marking overlays are cleared inside the boxes |
 | Reporting | Per-frame speed timeline (0 when stopped, robust median of nearby samples otherwise, short gaps bridged) → time-averaged per 3 s window with a status: moving / stopped / stopping-starting / low data / no data. The video is drawn in the same pass, a few seconds behind the analysis, so its overlay shows the final numbers (same as the table) |
 
 ## Settings
@@ -78,6 +83,10 @@ Command line (no window): `python cli.py video.mp4 --hfov 110`
   setting - one *Calibrate…* with a known speed fixes it for that dashcam.
 * Assumes a flat road and a normal (not strongly fisheye) lens.
 * Braking/pulling-away windows are smoothed over ~1.5 s, so they read a few km/h off.
+* Other vehicles' speeds are reliable up to about 50 m; further away (or while a vehicle
+  is cut off by the frame edge) only the box is shown. They share the camera scale with
+  our own speed, so *Calibrate…* corrects both. Vehicle detection adds roughly 50-80 %
+  to the analysis time on a 2-core laptop (less on more cores).
 
 `tools/make_synthetic.py` renders test videos with a known speed: `--stopgo` adds traffic and
 a stop; `--scene outback` (only solid edge lines, worn two-tone asphalt, scrub verges) or

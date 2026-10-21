@@ -27,6 +27,7 @@ from .road import RoadGrid, RoadModel
 from .egomotion import EgoMotion
 from .odometry import GroundFlow, SurfaceOdometry
 from .lineflow import LinePatternFlow
+from .vehicles import MODEL_PATH, VehicleDetector, VehicleSpeeds
 from .tracker import (LiveTimeline, MarkingTracker, SpeedSample, aggregate_windows, window_bounds,
                       window_row)
 
@@ -34,6 +35,7 @@ GRID_COLOUR = (0, 230, 255)      # yellow (BGR)
 EDGE_COLOUR = (0, 230, 255)
 HIT_COLOUR = (80, 255, 80)
 MARK_COLOUR = (255, 200, 0)      # cyan-ish
+VEH_COLOUR = (255, 60, 230)      # magenta (other vehicles)
 
 
 @dataclass
@@ -48,6 +50,7 @@ class Settings:
     window_s: float = 3.0
     proc_width: int = 960
     speedup: float = 1.0                  # video is fast-forwarded by this factor (1 = real time)
+    vehicles: bool = True                 # box other vehicles and show their speed in the video
 
 
 def _ffmpeg_exe():
@@ -265,9 +268,15 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
     I2BEV = cam.I2BEV
     width = s.proc_width
 
+    zoom_src = None              # full-resolution crop for far vehicles (x0, y0, x1, y1, scale)
+
     def prepare(frame):          # runs on the decoder thread (OpenCV releases the GIL)
         small = _resize(frame, width)
-        return small, cv2.warpPerspective(small, I2BEV, bev_size, flags=cv2.INTER_LINEAR)
+        bev = cv2.warpPerspective(small, I2BEV, bev_size, flags=cv2.INTER_LINEAR)
+        if zoom_src is None:
+            return small, bev, None
+        x0, y0, x1, y1, k = zoom_src
+        return small, bev, frame[int(y0 * k):int(y1 * k), int(x0 * k):int(x1 * k)]
 
     road = RoadModel(cam)
     grid_s = s.grid_start_m + np.arange(s.grid_lines) * 1.0
@@ -280,9 +289,29 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
     recent_surf: deque = deque(maxlen=int(fps))
     writer = VideoWriter(out / "annotated.mp4", cam.width, cam.height, fps)
 
+    # other vehicles: detected a few times per second, speed = ego speed + their speed
+    # across the grid relative to us
+    veh = det = None
+    if s.vehicles:
+        if MODEL_PATH.exists():
+            det = VehicleDetector()
+            veh = VehicleSpeeds(cam, fps_eff, speedup=s.speedup)
+            det_every = max(1, int(round(fps_eff / 4.0)))
+            det_band = veh.band()
+            zrect = veh.zoom_rect()
+            src_w = cv2.VideoCapture(path).get(cv2.CAP_PROP_FRAME_WIDTH) or cam.width
+            zoom_src = (*zrect, src_w / cam.width)
+            calib["vehicle_detection_hz"] = round(fps_eff / det_every, 2)
+        else:
+            log(f"vehicle model not found ({MODEL_PATH}); other vehicles are skipped")
+    n_threads = cv2.getNumThreads()
+    frame_t: list[float] = []             # true time of every frame (repeats share it)
+
     # Frames are drawn a few seconds after they are analysed, once their speed
     # values are final, so the video, the HUD and the table always agree.
     lag_raw = int(np.ceil(2 * live.half * fps)) + ego.enter + 6
+    if veh is not None:                   # vehicle speeds look ~1 s ahead too
+        lag_raw = max(lag_raw, int(np.ceil((1.5 * veh.half + 0.6) * fps)) + 2)
     pending: deque = deque()              # (frame index, small frame, overlay)
     rows_done: dict[int, dict] = {}
     st_hist = ego.history                 # per-frame 'stopped' flags (shared list)
@@ -318,7 +347,11 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
                 win_txt = f"window {row['window']}: --"
             else:
                 win_txt = f"window {row['window']}: {row['speed_kmh']:5.1f} km/h"
-            vis = _render(small, ov, [f"t = {t:6.2f} s", speed_txt, win_txt])
+            vehs = None
+            if veh is not None:
+                ego_v = 0.0 if st_hist[j] else v
+                vehs = veh.boxes_at(j, frame_t[j], ego_v, hold_frames=2 * det_every)
+            vis = _render(small, ov, [f"t = {t:6.2f} s", speed_txt, win_txt], vehs)
             writer.write(vis)
             state["written"] += 1
             if preview is not None and _time.monotonic() - state["t_prev"] > 0.2:
@@ -337,7 +370,7 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
     n_unique = 0
     last_ov = None
     try:
-        for small, bev in FrameSource(path, prepare):
+        for small, bev, zoom_img in FrameSource(path, prepare):
             if cancel is not None and cancel.is_set():
                 raise RuntimeError("Cancelled")
 
@@ -358,6 +391,7 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
                 live.lines.append(np.nan)
                 ego.history.append(ego.stationary)
                 pending.append((fi, small, last_ov))
+                frame_t.append(frame_t[-1] if frame_t else 0.0)
                 fi += 1
                 ready = fi - 1 - lag_raw
                 if ready >= 0:
@@ -365,6 +399,14 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
                     flush(live.finalize(ready))
                 continue
             t = n_unique / fps_eff            # true time of this real frame
+            if veh is not None and n_unique % det_every == 0:
+                cv2.setNumThreads(os.cpu_count() or 2)    # the detector wants every core
+                y0, y1 = det_band
+                full = [(b + [0, y0, 0, y0], c, k) for b, c, k in det.detect(small[y0:y1])]
+                zx0, zy0, _, _, zk = zoom_src
+                zoom = [(b / zk + [zx0, zy0, zx0, zy0], c, k) for b, c, k in det.detect(zoom_img)]
+                cv2.setNumThreads(n_threads)
+                veh.observe(fi, t, veh.merge(full, zoom, zrect))
             n_unique += 1
 
             road.update(bev, marking_mask, line_mask=marking_wide)
@@ -416,6 +458,7 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
 
             last_ov = _overlay(cam, grid, marking_mask, tracker, t, flash, free_s)
             pending.append((fi, small, last_ov))
+            frame_t.append(t)
             fi += 1
             ready = fi - 1 - lag_raw
             if ready >= 0:
@@ -444,6 +487,8 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
     result = {
         "fps": round(fps, 3), "frames": fi, "duration_s": round(duration, 2),
         "calibration": calib, "settings": asdict(s), "windows": rows,
+        "vehicles": veh.summary(lambda tt: float(timeline[min(bisect.bisect_left(frame_t, tt), fi - 1)]))
+                    if veh is not None else [],
         "stationary_s": round(float(stationary.sum()) / fps, 2),
         "surface_kmh": [None if not np.isfinite(v) else round(float(v) * 3.6, 1) for v in live.surface[:fi]],
         "timeline_kmh": [None if np.isnan(v) else round(float(v) * 3.6, 1) for v in timeline],
@@ -452,6 +497,9 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
                     for x in tracker.samples],
     }
     (out / "results.json").write_text(json.dumps(result, indent=2))
+    if veh is not None and os.environ.get("RS_DUMP_VEH"):        # debugging aid
+        import pickle
+        (out / "vehicles.pkl").write_bytes(pickle.dumps(veh))
     with open(out / "speed_table.csv", "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["window", "start_s", "end_s", "speed_kmh", "speed_mps", "status", "method",
@@ -547,7 +595,7 @@ def _overlay(cam, grid: RoadGrid, mmask, tracker: MarkingTracker, t, flash, free
 _TINT_CACHE: dict = {}
 
 
-def _render(frame, ov, hud_lines):
+def _render(frame, ov, hud_lines, vehicles=None):
     vis = frame.copy()
     if len(ov["marks"]):
         h, w = frame.shape[:2]
@@ -566,8 +614,49 @@ def _render(frame, ov, hud_lines):
         _draw_poly(vis, pts, colour, thick)
     for c in ov["dots"]:
         cv2.circle(vis, c, 4, (0, 0, 255), -1, cv2.LINE_AA)
+    if vehicles:
+        _draw_vehicles(vis, frame, vehicles)
     cv2.rectangle(vis, (10, 10), (330, 92), (20, 20, 20), -1)
     for i, txt in enumerate(hud_lines):
         cv2.putText(vis, txt, (20, 34 + 24 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1,
                     cv2.LINE_AA)
     return vis
+
+
+def _draw_vehicles(vis, frame, vehicles):
+    """Rectangle round each vehicle with its absolute speed on a tag above it.
+
+    The grid / marking overlay is wiped inside each box first so the vehicle stays
+    clearly visible, and tags are moved so they never overlap (near vehicles first)."""
+    H, W = vis.shape[:2]
+    items = []
+    for box, kmh, dist, tid in vehicles:
+        x1, y1, x2, y2 = [int(round(c)) for c in box]
+        x1, x2 = max(x1, 0), min(x2, W - 1)
+        y1, y2 = max(y1, 0), min(y2, H - 1)
+        if x2 - x1 >= 4 and y2 - y1 >= 4:
+            items.append((x1, y1, x2, y2, kmh, dist if np.isfinite(dist) else 1e9))
+    for x1, y1, x2, y2, _, _ in items:
+        vis[y1:y2, x1:x2] = frame[y1:y2, x1:x2]
+    for x1, y1, x2, y2, _, _ in items:
+        cv2.rectangle(vis, (x1, y1), (x2, y2), VEH_COLOUR, 2, cv2.LINE_AA)
+    placed = []
+    for x1, y1, x2, y2, kmh, _ in sorted(items, key=lambda v: v[5]):     # nearest first
+        if not np.isfinite(kmh):
+            continue
+        txt = f"{abs(kmh):.0f} km/h" + (" oncoming" if kmh < -5 else "")
+        (tw, th), base = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+        lw, lh = tw + 8, th + base + 6
+        tx = min(max(x1, 0), W - lw)
+        ty = y1 - lh - 2                       # top-left of the tag, just above the box
+        for _ in range(6):                     # move up past tags already placed
+            hit = [p for p in placed if tx < p[2] and tx + lw > p[0] and ty < p[3] and ty + lh > p[1]]
+            if not hit:
+                break
+            ty = min(p[1] for p in hit) - lh - 2
+        if ty < 0:
+            ty = y2 + 2
+        placed.append((tx, ty, tx + lw, ty + lh))
+        cv2.rectangle(vis, (tx, ty), (tx + lw, ty + lh), VEH_COLOUR, -1)
+        cv2.putText(vis, txt, (tx + 4, ty + th + 3), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1,
+                    cv2.LINE_AA)

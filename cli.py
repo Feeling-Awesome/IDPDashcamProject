@@ -16,9 +16,11 @@ def main():
     ap.add_argument("--grid-lines", type=int, default=12)
     ap.add_argument("--window", type=float, default=3.0)
     ap.add_argument("--speedup", type=float, default=1.0, help="video is fast-forwarded by this factor")
+    ap.add_argument("--no-vehicles", action="store_true", help="don't box other vehicles / show their speeds")
     a = ap.parse_args()
     s = Settings(hfov_deg=a.hfov, cam_height_m=a.height, lane_width_m=a.lane_width or None,
-                 horizon_frac=a.horizon, bonnet_frac=a.bonnet, grid_lines=a.grid_lines, window_s=a.window, speedup=a.speedup)
+                 horizon_frac=a.horizon, bonnet_frac=a.bonnet, grid_lines=a.grid_lines, window_s=a.window, speedup=a.speedup,
+                 vehicles=not a.no_vehicles)
     res = process_video(a.video, a.out, s, progress=lambda p, m: None)
     if res["calibration"].get("warning"):
         print("WARNING:", res["calibration"]["warning"])
@@ -26,6 +28,8 @@ def main():
     for r in res["windows"]:
         print(f"{r['window']:>4} {r['start_s']:>6} {r['end_s']:>6} {str(r['speed_kmh']):>7}  "
               f"{r['status']:<18} {r.get('method', '')}")
+    if res.get("vehicles"):
+        print(f"other vehicles (speeds are drawn on them in annotated.mp4): {len(res['vehicles'])}")
 
 
 if __name__ == "__main__":

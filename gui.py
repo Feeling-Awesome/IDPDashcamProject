@@ -86,6 +86,11 @@ class SettingsPanel(ttk.Frame):
             v = tk.StringVar(value="" if default is None else str(default))
             ttk.Entry(box, textvariable=v, width=12).pack(anchor="w")
             self.vars[key] = v
+        # other vehicles: rectangle + absolute speed drawn on each car in the video
+        v = tk.StringVar(value="1")
+        ttk.Checkbutton(self, text="Show other vehicles' speeds in the video", variable=v,
+                        onvalue="1", offvalue="0").grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        self.vars["vehicles"] = v
 
     # remembered between sessions (a dashcam's FOV / mounting rarely changes)
 
@@ -130,6 +135,7 @@ class SettingsPanel(ttk.Frame):
             grid_lines=int(num("grid_lines", 12, 3, 40)),
             window_s=num("window_s", 3.0, 0.5, 60),
             speedup=num("speedup", 1.0, 0.1, 100),
+            vehicles=self.vars["vehicles"].get() != "0",
         )
 
 

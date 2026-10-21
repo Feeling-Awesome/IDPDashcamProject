@@ -23,6 +23,7 @@ if not exist ".build-venv\Scripts\python.exe" %PY% -m venv .build-venv || goto f
 ".build-venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --windowed ^
   --name RoadSpeed --icon assets\icon.ico ^
   --add-data "assets;assets" ^
+  --add-data "speedgrid\models;speedgrid\models" ^
   --collect-all imageio_ffmpeg ^
   gui.py || goto fail
 
