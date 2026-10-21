@@ -99,6 +99,7 @@ class Obs:
     z: float                 # distance ahead from the box bottom (m), NaN if unusable
     x: float                 # lateral offset (m)
     conf: float
+    zml: float = float("nan")    # distance from the learned 3D box (see box3d.py), if a model is loaded
 
 
 @dataclass
@@ -132,8 +133,12 @@ class VehicleSpeeds:
 
     def __init__(self, cam: CameraModel, fps: float, speedup: float = 1.0, max_dist_m: float = 80.0,
                  half_window_s: float = 1.0, px_noise: float = 1.5, max_sd_kmh: float = 6.0,
-                 horizon_sd_frac: float = 0.012):
+                 horizon_sd_frac: float = 0.012, model=None):
         self.cam = cam
+        # optional learned size/orientation model (speedgrid/models/vehicle3d.onnx)
+        self.model = model
+        xw, yw, d = cam._axes
+        self.solve_cam = (cam.focal, cam.width / 2.0, cam.height / 2.0, np.column_stack([xw, yw, d]))
         self.fps = fps
         self.sp = max(float(speedup or 1.0), 0.01)
         self.max_dist = max_dist_m
@@ -178,7 +183,7 @@ class VehicleSpeeds:
                 out.append(d)
         return out
 
-    def observe(self, fi: int, t: float, dets):
+    def observe(self, fi: int, t: float, dets, frame=None):
         W = self.cam.width
         obs = []
         for box, conf, kind in dets:
@@ -192,6 +197,8 @@ class VehicleSpeeds:
                 if 0.5 < Z < 1.5 * self.max_dist:
                     z, x = float(Z), float(X)
             obs.append((Obs(fi, t, box, z, x, conf), kind))
+        if self.model is not None and frame is not None and obs:
+            self._learned_distances(frame, obs)
 
         live = [tr for tr in self.tracks]
         pairs = []
@@ -222,6 +229,22 @@ class VehicleSpeeds:
             if j not in used_o and o.conf >= 0.5:
                 self.tracks.append(VehicleTrack(self.next_id, kind, [o]))
                 self.next_id += 1
+
+    def _learned_distances(self, frame, obs):
+        """Size + orientation from the network, then the distance that makes a 3D box of
+        that size and heading match the detected box (no horizon / flat road needed)."""
+        from .box3d import solve_location
+        W = self.cam.width
+        try:
+            preds = self.model.predict(frame, [o.box for o, _ in obs])
+        except Exception:                      # a bad model file must never stop the analysis
+            return
+        for (o, kind), (dims, alpha) in zip(obs, preds):
+            x1, y1, x2, y2 = o.box
+            valid = (x1 > 3, y1 > self.band_top + 2, x2 < W - 4, y2 < self.bottom_y - 2)
+            loc, rms = solve_location(o.box, dims, alpha, self.solve_cam, valid)
+            if loc is not None and rms < 0.12 * max(y2 - y1, 8) and 0.5 < loc[2] < 1.5 * self.max_dist:
+                o.zml = float(loc[2])
 
     def all_tracks(self):
         return self.done + self.tracks
@@ -290,7 +313,15 @@ class VehicleSpeeds:
             frac_b = float(np.hypot(self.horizon_sd / dy, 0.03))   # relative error from the horizon
         hp, hsd = HEIGHT_PRIOR.get(tr.kind, HEIGHT_PRIOR["car"])
         hz = bottom_ok & top_ok & (hpx > 6)
-        if hz.sum() >= 3:
+        zml = np.array([o.zml for o in obs])
+        fml = None
+        if np.isfinite(zml).sum() >= 3:
+            # learned 3D box: knows the vehicle's actual size and which way it faces
+            okm = np.isfinite(zml)
+            hsd = self.model.depth_sd
+            fml = self._wfit(ts[okm], zml[okm], 0.5 * hsd * zml[okm] + 0.05, t)
+            z_s0 = fml[1] if fml is not None and fml[1] > 0.5 else float(np.median(zml[okm]))
+        elif hz.sum() >= 3:
             z_s0 = float(np.median(f * hp / hpx[hz]))
         if np.isfinite(z_b0) and np.isfinite(z_s0):
             # if the two disagree by more than their errors allow, the road isn't flat out
@@ -312,8 +343,11 @@ class VehicleSpeeds:
         if not (0.5 < Z0 < self.max_dist):
             return np.nan, Z0, np.nan
 
-        # --- relative speed: contact-distance rate (rescaled) and box growth
+        # --- relative speed: contact-distance rate (rescaled), learned-box distance rate, box growth
         vs, vw = [], []
+        if fml is not None:
+            vs.append(fml[0])
+            vw.append(1 / (fml[2] + 1e-3) ** 2)
         if fb is not None and np.isfinite(z_b0) and z_b0 > 0.5:
             k = (Z0 / z_b0) ** 2                            # undo the horizon error's effect on the rate
             v1 = v_b * k

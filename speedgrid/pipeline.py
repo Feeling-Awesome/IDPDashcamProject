@@ -28,6 +28,7 @@ from .egomotion import EgoMotion
 from .odometry import GroundFlow, SurfaceOdometry
 from .lineflow import LinePatternFlow
 from .vehicles import MODEL_PATH, VehicleDetector, VehicleSpeeds
+from .box3d import Vehicle3DModel
 from .tracker import (LiveTimeline, MarkingTracker, SpeedSample, aggregate_windows, window_bounds,
                       window_row)
 
@@ -295,7 +296,14 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
     if s.vehicles:
         if MODEL_PATH.exists():
             det = VehicleDetector()
-            veh = VehicleSpeeds(cam, fps_eff, speedup=s.speedup)
+            model3d = None
+            if Vehicle3DModel.available():
+                try:
+                    model3d = Vehicle3DModel()
+                    calib["vehicle_model"] = "learned 3D boxes"
+                except Exception as e:          # noqa: BLE001
+                    log(f"vehicle3d model could not be loaded ({e}); using the built-in method")
+            veh = VehicleSpeeds(cam, fps_eff, speedup=s.speedup, model=model3d)
             det_every = max(1, int(round(fps_eff / 4.0)))
             det_band = veh.band()
             zrect = veh.zoom_rect()
@@ -418,8 +426,8 @@ def process_video(path: str, out_dir: str, s: Settings | None = None,
                 full = [(b + [0, y0, 0, y0], c, k) for b, c, k in det.detect(small[y0:y1])]
                 zx0, zy0, _, _, zk = zoom_src
                 zoom = [(b / zk + [zx0, zy0, zx0, zy0], c, k) for b, c, k in det.detect(zoom_img)]
+                veh.observe(fi, t, veh.merge(full, zoom, zrect), frame=small)
                 cv2.setNumThreads(n_threads)
-                veh.observe(fi, t, veh.merge(full, zoom, zrect))
             n_unique += 1
 
             road.update(bev, marking_mask, line_mask=marking_wide)

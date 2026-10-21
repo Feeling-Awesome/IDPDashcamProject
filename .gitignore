@@ -11,3 +11,6 @@ dist/
 
 # analysis output
 output/
+
+# model training (Train Vehicle Model.bat)
+.train-venv/

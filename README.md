@@ -40,6 +40,16 @@ grain, the verge) moves across the grid between frames. The table says which was
 
 Command line (no window): `python cli.py video.mp4 --hfov 110` (add `--no-vehicles` to skip other vehicles)
 
+## Optional: train the vehicle model (NVIDIA GPU)
+
+Other vehicles' distances (and so their speeds) get better with a small learned model that
+predicts each vehicle's real size and which way it faces (from the KITTI driving dataset).
+Double-click **`Train Vehicle Model.bat`**: it installs PyTorch for your GPU into a private
+folder, downloads KITTI (12 GB, resumable) to `%USERPROFILE%\RoadSpeed-training`, trains
+for ~20-40 min and saves `speedgrid\models\vehicle3d.onnx` + `vehicle3d.json` (with the
+measured accuracy). The app uses it automatically; without it, the built-in method is used.
+Needs Python 3.9-3.13 and ~15 GB free disk. KITTI is CC BY-NC-SA 3.0 (non-commercial).
+
 ## How it works
 
 | Stage | Technique |
@@ -63,6 +73,7 @@ Command line (no window): `python cli.py video.mp4 --hfov 110` (add `--no-vehicl
 | Edge lines | Paint is searched up to 5 m beyond the colour-based road edge; a long solid line there becomes the grid edge (fixes two-tone / worn roads), and the edge stays locked to it through frames where the line isn't seen |
 | Crossing validation | A pair of crossings only counts if both happen within 0.6 s, the marking is moving, and the result agrees with its Kalman velocity (±35 %); nothing is counted while stopped |
 | Other vehicles | **YOLOX-S** detector (OpenCV DNN, COCO cars/trucks/buses/motorbikes) ~4× per second on the road band, plus a zoomed pass round the vanishing point cut from the full-resolution frame for far vehicles; boxes linked over time by overlap with each track's predicted box. **Distance** two ways: where the box's bottom edge touches the road (same ground-plane homography as the 1 m grid) and from the box height (a car is ~1.55 m tall whichever way it faces - no horizon needed); fused by their errors, and when they disagree (road not flat out there, nose-up while accelerating, horizon a few px off) the road-contact distance is down-weighted. **Relative speed** from the road-contact distance over ±1 s (±1.5 s far away), rescaled to the fused distance, and from how fast the box grows (d ln size/dt = −v/Z). **Absolute speed = our speed (smoothed over the last second) + relative speed.** Shown only when its estimated error is ≤ 6 km/h; a reading within its error of 0 is shown as 0, "oncoming" only when clearly so; grid and marking overlays are cleared inside the boxes |
+| Learned vehicle size (optional) | ResNet-18 trained on KITTI predicts each vehicle's height/width/length and observation angle from its crop (doubled-angle encoding: front and back give the same outline). A 3D box of that size and heading is moved until its projected outline matches the detection (Deep3DBox-style Gauss-Newton; height above the road left free, so no horizon or flat road is assumed; sides cut by the frame are ignored). That distance replaces the fixed-height guess, with the error measured on held-out KITTI images |
 | Reporting | Per-frame speed timeline (0 when stopped, robust median of nearby samples otherwise, short gaps bridged) → time-averaged per 3 s window with a status: moving / stopped / stopping-starting / low data / no data. The video is drawn in the same pass, a few seconds behind the analysis, so its overlay shows the final numbers (same as the table) |
 
 ## Settings
